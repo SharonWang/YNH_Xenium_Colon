@@ -1,0 +1,7 @@
+tissue	region_id	mouse_id	position	section_id	biological_replicate_id	technical_replicate_id	genotype	treatment	condition	age_weeks	metadata_status	do_not_interpret	notes
+colon	Region_1	Mouse_1	top	Region_1	Mouse_1	Region_1	WT	Not_provided	Not_provided	Not_provided	VERIFIED_USER_SUPPLIED	FALSE	Mouse 1 top colon section
+colon	Region_2	Mouse_1	middle	Region_2	Mouse_1	Region_2	WT	Not_provided	Not_provided	Not_provided	VERIFIED_USER_SUPPLIED	FALSE	Mouse 1 middle colon section
+colon	Region_3	Mouse_1	bottom	Region_3	Mouse_1	Region_3	WT	Not_provided	Not_provided	Not_provided	VERIFIED_USER_SUPPLIED	FALSE	Mouse 1 bottom colon section
+colon	Region_4	Mouse_2	top	Region_4	Mouse_2	Region_4	WT	Not_provided	Not_provided	Not_provided	VERIFIED_USER_SUPPLIED	FALSE	Mouse 2 top colon section
+colon	Region_5	Mouse_2	middle	Region_5	Mouse_2	Region_5	WT	Not_provided	Not_provided	Not_provided	VERIFIED_USER_SUPPLIED	FALSE	Mouse 2 middle colon section
+colon	Region_6	Mouse_2	bottom	Region_6	Mouse_2	Region_6	WT	Not_provided	Not_provided	Not_provided	VERIFIED_USER_SUPPLIED	FALSE	Mouse 2 bottom colon section

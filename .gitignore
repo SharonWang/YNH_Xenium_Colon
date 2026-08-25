@@ -1,0 +1,18 @@
+# Full and subset data are generated outside the tracked source tree.
+/subset_input/
+/colon_qc_outputs/
+/colon_qc_logs/
+/tmp/
+/R_libs/
+/hpc_return/
+
+# Executed notebooks are outputs; committed source notebooks stay clean.
+*.executed.ipynb
+*.input.ipynb
+.ipynb_checkpoints/
+
+# Local interpreter caches.
+__pycache__/
+*.pyc
+.Rhistory
+.RData

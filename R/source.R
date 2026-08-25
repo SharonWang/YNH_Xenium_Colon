@@ -1092,23 +1092,93 @@ calculate_readiness_gates <- function(inventory, integrity, panel_reconciliation
   gates
 }
 
+#' Return the canonical ordered identifiers for the six colon regions.
+expected_colon_regions <- function() paste0("Region_", seq_len(6L))
+
+#' Return a colour-blind-friendly, stable six-region palette.
 section_palette <- function() {
-  c(Region_1 = "#3C5488", Region_2 = "#00A087", Region_3 = "#E64B35", Region_4 = "#F39B7F")
+  c(
+    Region_1 = "#3C5488", Region_2 = "#00A087", Region_3 = "#E64B35",
+    Region_4 = "#F39B7F", Region_5 = "#8491B4", Region_6 = "#4DBBD5"
+  )
 }
 
+#' Return the neutral pre-summary status for valid colon regions.
+#'
+#' This replaces inherited scWAT anchor/sensitivity labels. Final readiness is
+#' derived from the current region's QC gates by derive_colon_region_readiness.
 section_downstream_status <- function(region_id) {
-  status <- c(
-    Region_1 = "PRIMARY_CONDITIONAL",
-    Region_2 = "PRIMARY_CONDITIONAL",
-    Region_3 = "PRIMARY",
-    Region_4 = "SENSITIVITY_ONLY"
-  )
+  status <- stats::setNames(rep("QC_EVIDENCE_PENDING", 6L), expected_colon_regions())
   region_id <- as.character(region_id)
   unknown <- setdiff(unique(region_id), names(status))
   if (length(unknown)) {
-    stop(sprintf("Unknown scWAT region: %s", paste(unknown, collapse = ", ")), call. = FALSE)
+    stop(sprintf("Unknown colon region: %s", paste(unknown, collapse = ", ")), call. = FALSE)
   }
   unname(status[region_id])
+}
+
+#' Validate one coherent index of six region-level result bundles.
+validate_section_bundle_index <- function(index, expected_regions = expected_colon_regions()) {
+  required <- c("region_id", "run_label", "execution_mode", "section_output_dir")
+  missing <- setdiff(required, names(index))
+  if (length(missing)) stop(sprintf("Section bundle index missing columns: %s", paste(missing, collapse = ", ")), call. = FALSE)
+  if (nrow(index) != length(expected_regions) || !setequal(index$region_id, expected_regions) || anyDuplicated(index$region_id)) {
+    stop(sprintf("Expected exactly six unique colon section bundles (%s); duplicates and omissions are invalid.", paste(expected_regions, collapse = ", ")), call. = FALSE)
+  }
+  if (length(unique(index$run_label)) != 1L) stop("All section bundles must have one run label.", call. = FALSE)
+  if (length(unique(index$execution_mode)) != 1L) stop("All section bundles must have one execution mode.", call. = FALSE)
+  index[match(expected_regions, index$region_id), , drop = FALSE]
+}
+
+#' Reject spatial-neighbour edges that cross Xenium region boundaries.
+validate_within_region_spatial_edges <- function(edges) {
+  required <- c("region_id_from", "region_id_to")
+  missing <- setdiff(required, names(edges))
+  if (length(missing)) stop(sprintf("Spatial edges missing columns: %s", paste(missing, collapse = ", ")), call. = FALSE)
+  if (any(is.na(edges$region_id_from) | is.na(edges$region_id_to) | edges$region_id_from != edges$region_id_to)) {
+    stop("Cross-region spatial edges are scientifically invalid for independently imaged Xenium regions.", call. = FALSE)
+  }
+  TRUE
+}
+
+#' Derive ordered colon-region readiness from current overall QC gates.
+derive_colon_region_readiness <- function(gates, expected_regions = expected_colon_regions()) {
+  required <- c("region_id", "gate", "status")
+  missing <- setdiff(required, names(gates))
+  if (length(missing)) stop(sprintf("Readiness gates missing columns: %s", paste(missing, collapse = ", ")), call. = FALSE)
+  overall <- gates[gates$gate == "overall", c("region_id", "status"), drop = FALSE]
+  if (nrow(overall) != length(expected_regions) || anyDuplicated(overall$region_id) || !setequal(overall$region_id, expected_regions)) {
+    stop("Exactly one overall readiness gate is required for each of the six colon regions.", call. = FALSE)
+  }
+  overall <- overall[match(expected_regions, overall$region_id), , drop = FALSE]
+  overall$biological_interpretation_allowed <- overall$status == "PASS"
+  rownames(overall) <- NULL
+  overall
+}
+
+#' Add mouse/position metadata and produce descriptive position summaries.
+#'
+#' With two mice these are descriptive QC comparisons, not inferential tests;
+#' cells are never treated as independent biological replicates.
+summarise_colon_mouse_position <- function(section_summary, manifest) {
+  needed_summary <- c("region_id", "input_cells", "core_qc_pass")
+  needed_manifest <- c("region_id", "mouse_id", "position")
+  if (length(setdiff(needed_summary, names(section_summary)))) stop("Section summary lacks region_id/input_cells/core_qc_pass.", call. = FALSE)
+  if (length(setdiff(needed_manifest, names(manifest)))) stop("Manifest lacks region_id/mouse_id/position.", call. = FALSE)
+  regions <- expected_colon_regions()
+  if (!setequal(section_summary$region_id, regions) || !setequal(manifest$region_id, regions)) stop("Section summary and manifest must both contain all six colon regions.", call. = FALSE)
+  region_summary <- merge(manifest[, needed_manifest], section_summary, by = "region_id", sort = FALSE)
+  region_summary <- region_summary[match(regions, region_summary$region_id), , drop = FALSE]
+  region_summary$core_pass_fraction <- ifelse(region_summary$input_cells > 0, region_summary$core_qc_pass / region_summary$input_cells, NA_real_)
+  within_mouse <- region_summary[order(region_summary$mouse_id, match(region_summary$position, c("top", "middle", "bottom"))), , drop = FALSE]
+  matched_position <- stats::aggregate(
+    region_summary[, c("input_cells", "core_qc_pass", "core_pass_fraction"), drop = FALSE],
+    by = list(position = region_summary$position), FUN = mean, na.rm = TRUE
+  )
+  matched_position$n_mice <- as.integer(table(region_summary$position)[matched_position$position])
+  matched_position <- matched_position[match(c("top", "middle", "bottom"), matched_position$position), , drop = FALSE]
+  rownames(region_summary) <- rownames(within_mouse) <- rownames(matched_position) <- NULL
+  list(region_summary = region_summary, within_mouse = within_mouse, matched_position = matched_position)
 }
 
 build_cell_downstream_masks <- function(cell_metadata, spatial_hotspots = data.frame(), provenance) {
@@ -1921,14 +1991,15 @@ slide_section_required_files <- function() {
   c("qc_summary.tsv", "qc_thresholds.tsv", "section_readiness_gates.tsv", "analysis_alerts.tsv", "cell_qc_metadata.tsv.gz")
 }
 
-validate_four_section_outputs <- function(run_root, expected_regions = paste0("Region_", 1:4)) {
+#' Validate the six section directories required by the colon slide summary.
+validate_colon_section_outputs <- function(run_root, expected_regions = expected_colon_regions()) {
   sections_root <- file.path(run_root, "sections")
   dirs <- list.dirs(sections_root, recursive = FALSE, full.names = TRUE)
   region_ids <- basename(dirs)
   valid_dirs <- region_ids %in% expected_regions
   dirs <- dirs[valid_dirs]; region_ids <- region_ids[valid_dirs]
-  if (length(dirs) != 4L || !setequal(region_ids, expected_regions) || anyDuplicated(region_ids)) {
-    stop(sprintf("Expected exactly four unique section outputs (%s).", paste(expected_regions, collapse = ", ")), call. = FALSE)
+  if (length(dirs) != length(expected_regions) || !setequal(region_ids, expected_regions) || anyDuplicated(region_ids)) {
+    stop(sprintf("Expected exactly six unique colon section outputs (%s).", paste(expected_regions, collapse = ", ")), call. = FALSE)
   }
   order_index <- match(expected_regions, region_ids)
   dirs <- dirs[order_index]; region_ids <- region_ids[order_index]
@@ -1941,8 +2012,9 @@ validate_four_section_outputs <- function(run_root, expected_regions = paste0("R
   data.frame(region_id = region_ids, section_output_dir = normalizePath(dirs, winslash = "/", mustWork = TRUE), stringsAsFactors = FALSE)
 }
 
-read_slide_qc_outputs <- function(run_root, expected_regions = paste0("Region_", 1:4)) {
-  coverage <- validate_four_section_outputs(run_root, expected_regions)
+#' Read one coherent set of six colon section-QC outputs.
+read_slide_qc_outputs <- function(run_root, expected_regions = expected_colon_regions()) {
+  coverage <- validate_colon_section_outputs(run_root, expected_regions)
   read_one <- function(filename, gzipped = FALSE) {
     tables <- lapply(seq_len(nrow(coverage)), function(index) {
       path <- file.path(coverage$section_output_dir[[index]], filename)
@@ -1960,16 +2032,14 @@ read_slide_qc_outputs <- function(run_root, expected_regions = paste0("Region_",
   )
 }
 
+#' Summarise cell QC and evidence-derived readiness across six colon regions.
 summarise_slide_qc <- function(slide_data) {
   summary <- slide_data$qc_summary
   summary$core_pass_fraction <- ifelse(summary$input_cells > 0, summary$core_qc_pass / summary$input_cells, NA_real_)
   summary$review_fraction <- ifelse(summary$input_cells > 0, summary$review_flagged / summary$input_cells, NA_real_)
   overall_rows <- slide_data$gates[slide_data$gates$gate == "overall", , drop = FALSE]
   overall_status <- if (nrow(overall_rows)) overall_readiness(overall_rows$status) else "HOLD"
-  readiness <- data.frame(
-    region_id = overall_rows$region_id, status = overall_rows$status,
-    biological_interpretation_allowed = overall_rows$status == "PASS", stringsAsFactors = FALSE
-  )
+  readiness <- derive_colon_region_readiness(slide_data$gates, expected_colon_regions())
   list(section_summary = summary, readiness = readiness, overall_status = overall_status)
 }
 

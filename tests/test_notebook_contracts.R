@@ -34,3 +34,18 @@ stopifnot(!grepl("scWAT", summary_text, fixed = TRUE), !grepl("adipose_analysis"
 assert_cleared(summary)
 
 cat("Seven colon notebook contracts passed.\n")
+
+launcher_files <- c(
+  file.path("scripts", "execute_local_subset.ps1"),
+  file.path("shell", "run_notebook_qc_hpc.sh"),
+  file.path("slurm", "colon_notebook_qc.sbatch"),
+  "README.md"
+)
+stopifnot(all(file.exists(launcher_files)))
+launcher_text <- paste(vapply(launcher_files, function(path) paste(readLines(path, warn = FALSE), collapse = "\n"), character(1)), collapse = "\n")
+stopifnot(grepl("D:\\\\Xiaonan\\\\CODEX_projects\\\\Yanan_Xenium\\\\colon_analysis", launcher_text))
+stopifnot(grepl("/dssg/home/acct-svetoslav_chakarov/svetoslav_chakarov/Lab_members/Yanan_Hu/YNH_Xenium/colon_analysis", launcher_text, fixed = TRUE))
+stopifnot(all(vapply(regions, grepl, logical(1), x = launcher_text, fixed = TRUE)))
+stopifnot(all(vapply(c("Matrix", "jsonlite", "ggplot2", "arrow", "dplyr", "RANN"), grepl, logical(1), x = launcher_text, fixed = TRUE)))
+stopifnot(!grepl("adipose_analysis", launcher_text, fixed = TRUE))
+cat("Local and HPC launcher contracts passed.\n")

@@ -164,6 +164,64 @@ require_package <- function(package) {
   if (!requireNamespace(package, quietly = TRUE)) stop(sprintf("Required R package '%s' is unavailable.", package), call. = FALSE)
 }
 
+#' Read and validate the user-approved fixed primary cell-QC thresholds.
+#'
+#' The configuration must contain exactly one exclusive lower and upper bound
+#' for both nFeature_Xenium and nCount_Xenium. Keeping these values in a
+#' version-controlled table makes the same scientific rule apply to every
+#' colon region and prevents data-adaptive thresholds from changing inclusion.
+read_fixed_cell_qc_thresholds <- function(path) {
+  if (!file.exists(path)) stop(sprintf("Fixed cell-QC threshold config not found: %s", path), call. = FALSE)
+  x <- utils::read.delim(path, check.names = FALSE, stringsAsFactors = FALSE)
+  required <- c("metric", "bound", "value", "inclusive")
+  missing <- setdiff(required, names(x))
+  if (length(missing)) stop(sprintf("Fixed cell-QC config missing columns: %s", paste(missing, collapse = ", ")), call. = FALSE)
+  x$metric <- trimws(as.character(x$metric))
+  x$bound <- tolower(trimws(as.character(x$bound)))
+  key <- paste(x$metric, x$bound, sep = "::")
+  expected <- c(
+    "nFeature_Xenium::lower", "nFeature_Xenium::upper",
+    "nCount_Xenium::lower", "nCount_Xenium::upper"
+  )
+  if (nrow(x) != 4L || anyDuplicated(key) || !setequal(key, expected)) {
+    stop("Fixed cell-QC config must contain exactly the four expected metric/bound rows.", call. = FALSE)
+  }
+  values <- suppressWarnings(as.numeric(x$value))
+  inclusive <- toupper(trimws(as.character(x$inclusive)))
+  if (any(!is.finite(values))) stop("Fixed cell-QC threshold values must be finite numbers.", call. = FALSE)
+  if (any(!inclusive %in% c("TRUE", "FALSE"))) stop("Fixed cell-QC inclusive values must be TRUE or FALSE.", call. = FALSE)
+  if (any(inclusive == "TRUE")) stop("The approved colon primary QC bounds are exclusive; inclusive must be FALSE.", call. = FALSE)
+  value_for <- function(metric, bound) values[key == paste(metric, bound, sep = "::")][[1L]]
+  out <- list(
+    feature_lower = value_for("nFeature_Xenium", "lower"),
+    feature_upper = value_for("nFeature_Xenium", "upper"),
+    count_lower = value_for("nCount_Xenium", "lower"),
+    count_upper = value_for("nCount_Xenium", "upper")
+  )
+  if (out$feature_lower >= out$feature_upper || out$count_lower >= out$count_upper) {
+    stop("Each fixed cell-QC lower bound must be less than its upper bound.", call. = FALSE)
+  }
+  out$rule <- sprintf(
+    "nFeature_Xenium > %g & nFeature_Xenium < %g & nCount_Xenium > %g & nCount_Xenium < %g",
+    out$feature_lower, out$feature_upper, out$count_lower, out$count_upper
+  )
+  out
+}
+
+#' Apply the fixed, exclusive primary cell-QC rule.
+#'
+#' Missing or non-finite measurements fail safely. Segmentation and control
+#' flags are intentionally not part of this primary mask; they remain review
+#' evidence and are incorporated by the stricter sensitivity mask.
+apply_fixed_primary_bounds <- function(n_feature, n_count, thresholds) {
+  required <- c("feature_lower", "feature_upper", "count_lower", "count_upper")
+  if (!is.list(thresholds) || !all(required %in% names(thresholds))) stop("Invalid fixed cell-QC thresholds object.", call. = FALSE)
+  if (length(n_feature) != length(n_count)) stop("n_feature and n_count must have equal lengths.", call. = FALSE)
+  is.finite(n_feature) & is.finite(n_count) &
+    n_feature > thresholds$feature_lower & n_feature < thresholds$feature_upper &
+    n_count > thresholds$count_lower & n_count < thresholds$count_upper
+}
+
 read_extended_qc_config <- function(path) {
   if (!file.exists(path)) stop(sprintf("Extended QC config not found: %s", path), call. = FALSE)
   config <- utils::read.delim(path, check.names = FALSE, stringsAsFactors = FALSE)
@@ -960,7 +1018,12 @@ robust_interval <- function(x, lower_mads = 3, upper_mads = 5, floor_value = -In
   c(lower = max(floor_value, lower), upper = upper, median = median_value, mad = mad_value, method = method)
 }
 
-calculate_xenium_cell_qc <- function(counts, cells, region_id) {
+#' Calculate per-cell Xenium QC metrics for one colon region.
+#'
+#' Primary inclusion uses the fixed user-approved exclusive bounds. Robust
+#' intervals are still calculated for descriptive diagnostics and review-only
+#' segmentation flags, but they cannot alter primary_include.
+calculate_xenium_cell_qc <- function(counts, cells, region_id, fixed_thresholds) {
   require_package("Matrix")
   required <- c("cell_id", "total_counts", "control_probe_counts", "genomic_control_counts", "control_codeword_counts", "cell_area", "nucleus_count")
   missing <- setdiff(required, names(cells))
@@ -968,19 +1031,18 @@ calculate_xenium_cell_qc <- function(counts, cells, region_id) {
   if (!identical(colnames(counts), cells$cell_id)) stop("Count columns and cell metadata are not aligned.", call. = FALSE)
   n_count <- as.numeric(Matrix::colSums(counts))
   n_feature <- as.numeric(Matrix::colSums(counts > 0))
-  count_bounds <- robust_interval(n_count, 3, 5, 1)
-  feature_bounds <- robust_interval(n_feature, 3, 5, 1)
+  count_descriptive <- robust_interval(n_count, 3, 5, 1)
+  feature_descriptive <- robust_interval(n_feature, 3, 5, 1)
   area_bounds <- robust_interval(cells$cell_area, 5, 5, 0)
   control_count <- cells$control_probe_counts + cells$genomic_control_counts + cells$control_codeword_counts
   control_fraction <- ifelse(cells$total_counts > 0, control_count / cells$total_counts, 0)
   control_upper <- max(0.05, safe_quantile(control_fraction, 0.995))
-  qc_core_pass <- n_count >= as.numeric(count_bounds["lower"]) & n_count <= as.numeric(count_bounds["upper"]) &
-    n_feature >= as.numeric(feature_bounds["lower"]) & n_feature <= as.numeric(feature_bounds["upper"])
+  qc_core_pass <- apply_fixed_primary_bounds(n_feature, n_count, fixed_thresholds)
   nucleus_missing <- cells$nucleus_count == 0
   multiple_nuclei <- cells$nucleus_count > 1
   area_outlier <- cells$cell_area < as.numeric(area_bounds["lower"]) | cells$cell_area > as.numeric(area_bounds["upper"])
   high_control <- control_fraction > control_upper
-  high_complexity <- n_count > as.numeric(count_bounds["upper"]) | n_feature > as.numeric(feature_bounds["upper"])
+  high_complexity <- n_count > as.numeric(count_descriptive["upper"]) | n_feature > as.numeric(feature_descriptive["upper"])
   segmentation_multiplet <- multiple_nuclei | (high_complexity & cells$cell_area > as.numeric(area_bounds["upper"]))
   out <- cells
   out$region_id <- region_id; out$nCount_Xenium <- n_count; out$nFeature_Xenium <- n_feature
@@ -990,8 +1052,8 @@ calculate_xenium_cell_qc <- function(counts, cells, region_id) {
   out$qc_core_pass <- qc_core_pass
   out$qc_review_flag <- nucleus_missing | segmentation_multiplet | area_outlier | high_control | !qc_core_pass
   thresholds <- rbind(
-    data.frame(metric = "nCount_Xenium", lower = as.numeric(count_bounds["lower"]), upper = as.numeric(count_bounds["upper"]), value = as.numeric(count_bounds["median"]), method = count_bounds["method"]),
-    data.frame(metric = "nFeature_Xenium", lower = as.numeric(feature_bounds["lower"]), upper = as.numeric(feature_bounds["upper"]), value = as.numeric(feature_bounds["median"]), method = feature_bounds["method"]),
+    data.frame(metric = "nCount_Xenium", lower = fixed_thresholds$count_lower, upper = fixed_thresholds$count_upper, value = stats::median(n_count), method = "fixed_exclusive_user_approved"),
+    data.frame(metric = "nFeature_Xenium", lower = fixed_thresholds$feature_lower, upper = fixed_thresholds$feature_upper, value = stats::median(n_feature), method = "fixed_exclusive_user_approved"),
     data.frame(metric = "cell_area", lower = as.numeric(area_bounds["lower"]), upper = as.numeric(area_bounds["upper"]), value = as.numeric(area_bounds["median"]), method = area_bounds["method"]),
     data.frame(metric = "control_fraction_cell", lower = 0, upper = control_upper, value = stats::median(control_fraction), method = "max_5pct_or_q99.5")
   )
@@ -1065,9 +1127,10 @@ build_cell_downstream_masks <- function(cell_metadata, spatial_hotspots = data.f
     stop("A non-empty provenance value is required for downstream masks.", call. = FALSE)
   }
   out <- cell_metadata
-  out$primary_include <- as.logical(out$qc_core_pass) &
-    !as.logical(out$segmentation_multiplet_flag) & !as.logical(out$high_control_flag)
-  out$strict_include <- !as.logical(out$qc_review_flag)
+  # The primary cohort is defined only by the approved fixed feature/count
+  # bounds. Review flags must not silently change this prespecified cohort.
+  out$primary_include <- as.logical(out$qc_core_pass)
+  out$strict_include <- out$primary_include & !as.logical(out$qc_review_flag)
   hotspot_ids <- character()
   if (nrow(spatial_hotspots)) {
     hotspot_required <- c("grid_id", "hotspot_status")
@@ -1083,8 +1146,8 @@ build_cell_downstream_masks <- function(cell_metadata, spatial_hotspots = data.f
   }
   out$hotspot_sensitivity_include <- out$primary_include & !out$hotspot_review_cell
   out$section_status <- section_downstream_status(out$region_id)
-  out$mask_rule_primary <- "qc_core_pass AND NOT segmentation_multiplet_flag AND NOT high_control_flag"
-  out$mask_rule_strict <- "NOT qc_review_flag"
+  out$mask_rule_primary <- "nFeature_Xenium > 5 AND nFeature_Xenium < 200 AND nCount_Xenium > 10 AND nCount_Xenium < 1000"
+  out$mask_rule_strict <- "primary_include AND NOT qc_review_flag"
   out$mask_rule_hotspot_sensitivity <- "primary_include AND NOT Region_3 morphology-review hotspot cell"
   out$provenance <- provenance
   out

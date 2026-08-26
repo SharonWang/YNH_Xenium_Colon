@@ -78,3 +78,5 @@ bash shell/run_notebook_qc_hpc.sh ALL colon_qc_hpc_full_$(date +%Y%m%d)
 Region artifacts are written to `colon_analysis/colon_qc_outputs/<RUN_LABEL>/sections/Region_N/`; the summary is written to `.../slide_summary/`; executed notebook copies are written to `.../executed_notebooks/`. Source notebooks are never overwritten.
 
 Local subset results validate code paths only. Final technical readiness must be based on full HPC output. With two mice, top/middle/bottom comparisons are descriptive, and adipose-derived eosinophil programs are treated as colon hypotheses rather than validated lifespan identities.
+
+The expected local code-path reference is versioned in `config/subset_qc_reference.tsv`. Because the subset deliberately enriches boundary cells and QC anomalies, its pass fractions must not be interpreted as full-region cell-quality estimates.

@@ -1282,6 +1282,178 @@ write_gz_tsv <- function(x, path, project_root) {
   invisible(path)
 }
 
+#' Write one reloadable, non-destructive colon region QC bundle.
+#'
+#' Raw sparse counts and all cells are retained. The saved cell table includes
+#' primary, strict, and hotspot-sensitivity masks plus their provenance.
+write_colon_region_qc_bundle <- function(project_root, output_dir, region_id, run_label,
+                                         execution_mode, manifest, inventory, integrity,
+                                         bundle, cell_qc, masks) {
+  require_package("Matrix")
+  assert_path_within(project_root, output_dir)
+  normalized_output <- canonical_path(output_dir)
+  if (!grepl("/colon_analysis/", normalized_output, fixed = TRUE)) stop("Colon QC outputs must be below colon_analysis.", call. = FALSE)
+  if (grepl("adipose_analysis", normalized_output, fixed = TRUE)) stop("Colon QC outputs cannot use adipose_analysis.", call. = FALSE)
+  if (!region_id %in% expected_colon_regions()) stop("Invalid colon region identifier.", call. = FALSE)
+  if (!inherits(bundle$counts, "sparseMatrix") || ncol(bundle$counts) != nrow(masks)) stop("Sparse counts and cell masks are not aligned.", call. = FALSE)
+  if (!identical(colnames(bundle$counts), masks$cell_id)) stop("Sparse count columns and mask cell IDs differ.", call. = FALSE)
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  configuration <- data.frame(
+    region_id = region_id, run_label = run_label, execution_mode = execution_mode,
+    primary_rule = unique(masks$mask_rule_primary)[[1L]], cells_deleted = 0L,
+    stringsAsFactors = FALSE
+  )
+  gates <- data.frame(
+    region_id = region_id,
+    gate = c("required_files", "matrix_integrity", "fixed_primary_mask", "metadata", "overall"),
+    status = c(
+      if (nrow(inventory) && all(inventory$exists)) "PASS" else "HOLD",
+      if (nrow(integrity) == 1L && isTRUE(integrity$dimension_match[[1L]])) "PASS" else "HOLD",
+      if (!anyNA(masks$primary_include)) "PASS" else "HOLD",
+      if (all(manifest$region_id %in% expected_colon_regions())) "PASS" else "HOLD",
+      "PENDING"
+    ),
+    details = c(
+      "All minimum region inputs exist", "Sparse matrix/features/barcodes/cells align",
+      "Fixed exclusive primary mask contains no missing values", "Six-row colon manifest loaded",
+      "Derived from current technical gates"
+    ), stringsAsFactors = FALSE
+  )
+  gates$status[gates$gate == "overall"] <- overall_readiness(gates$status[gates$gate != "overall"])
+  alarms <- empty_alarm_table()
+  if (!"region_id" %in% names(alarms)) alarms$region_id <- character(nrow(alarms))
+  configuration_fields <- c("run_label", "execution_mode")
+  for (field in configuration_fields) {
+    cell_qc$summary[[field]] <- configuration[[field]][[1L]]
+    cell_qc$thresholds[[field]] <- configuration[[field]][[1L]]
+    gates[[field]] <- configuration[[field]][[1L]]
+  }
+  write_tsv(configuration, file.path(output_dir, "run_configuration.tsv"), project_root)
+  write_tsv(manifest[manifest$region_id == region_id, , drop = FALSE], file.path(output_dir, "sample_metadata.tsv"), project_root)
+  write_tsv(inventory, file.path(output_dir, "input_inventory.tsv"), project_root)
+  write_tsv(integrity, file.path(output_dir, "input_integrity.tsv"), project_root)
+  write_tsv(cell_qc$summary, file.path(output_dir, "qc_summary.tsv"), project_root)
+  write_tsv(cell_qc$thresholds, file.path(output_dir, "qc_thresholds.tsv"), project_root)
+  write_tsv(gates, file.path(output_dir, "section_readiness_gates.tsv"), project_root)
+  write_tsv(alarms, file.path(output_dir, "analysis_alerts.tsv"), project_root)
+  write_gz_tsv(masks, file.path(output_dir, "cell_qc_metadata.tsv.gz"), project_root)
+  qc_object <- list(
+    region_id = region_id, run_label = run_label, execution_mode = execution_mode,
+    counts = bundle$counts, cells = masks, features = bundle$features,
+    thresholds = cell_qc$thresholds, summary = cell_qc$summary, gates = gates
+  )
+  object_path <- file.path(output_dir, paste0(region_id, ".phase0_2_qc.rds"))
+  saveRDS(qc_object, object_path, compress = "xz")
+  # Reader-facing technical QC figures use the same unfiltered cell table as
+  # the saved object, so primary failures and review flags remain visible.
+  region_plots <- plot_section_qc(masks, region_id)
+  save_section_plots(region_plots, file.path(output_dir, "figures"), region_id, project_root)
+  writeLines(capture.output(sessionInfo()), file.path(output_dir, "session_info.txt"), useBytes = TRUE)
+  data.frame(region_id = region_id, output_dir = normalized_output, cells = nrow(masks), primary_include = sum(masks$primary_include), cells_deleted = 0L)
+}
+
+#' Reload and validate one colon region QC bundle.
+validate_colon_region_qc_bundle <- function(output_dir, region_id, stop_on_error = TRUE) {
+  required <- c(
+    "run_configuration.tsv", "sample_metadata.tsv", "input_inventory.tsv", "input_integrity.tsv",
+    "qc_summary.tsv", "qc_thresholds.tsv", "section_readiness_gates.tsv", "analysis_alerts.tsv",
+    "cell_qc_metadata.tsv.gz", paste0(region_id, ".phase0_2_qc.rds"), "session_info.txt",
+    file.path("figures", paste0(region_id, "_qc_overview.pdf")),
+    file.path("figures", paste0(region_id, "_counts.png")),
+    file.path("figures", paste0(region_id, "_features.png")),
+    file.path("figures", paste0(region_id, "_area.png")),
+    file.path("figures", paste0(region_id, "_spatial.png"))
+  )
+  paths <- file.path(output_dir, required)
+  valid <- all(file.exists(paths))
+  message <- if (valid) "PASS" else sprintf("Missing artifacts: %s", paste(basename(paths[!file.exists(paths)]), collapse = ", "))
+  if (valid) {
+    object <- tryCatch(readRDS(file.path(output_dir, paste0(region_id, ".phase0_2_qc.rds"))), error = identity)
+    cells <- tryCatch(utils::read.delim(gzfile(file.path(output_dir, "cell_qc_metadata.tsv.gz")), check.names = FALSE), error = identity)
+    valid <- !inherits(object, "error") && !inherits(cells, "error") && inherits(object$counts, "sparseMatrix") &&
+      ncol(object$counts) == nrow(cells) && identical(colnames(object$counts), as.character(cells$cell_id)) &&
+      !anyNA(cells[, c("primary_include", "strict_include", "hotspot_sensitivity_include"), drop = FALSE])
+    if (!valid) message <- "Saved sparse object or cell mask failed reload/alignment validation."
+  }
+  if (!valid && isTRUE(stop_on_error)) stop(message, call. = FALSE)
+  valid
+}
+
+#' Read six coherent colon region bundles for the slide summary.
+read_colon_slide_qc_outputs <- function(run_root, expected_regions = expected_colon_regions(),
+                                        run_label = NULL, execution_mode = NULL) {
+  section_dirs <- file.path(run_root, "sections", expected_regions)
+  index_rows <- lapply(seq_along(expected_regions), function(i) {
+    region <- expected_regions[[i]]; output_dir <- section_dirs[[i]]
+    validate_colon_region_qc_bundle(output_dir, region)
+    config <- utils::read.delim(file.path(output_dir, "run_configuration.tsv"), check.names = FALSE)
+    data.frame(region_id = region, run_label = config$run_label[[1L]], execution_mode = config$execution_mode[[1L]], section_output_dir = output_dir)
+  })
+  coverage <- validate_section_bundle_index(do.call(rbind, index_rows), expected_regions)
+  if (!is.null(run_label) && !identical(unique(coverage$run_label), run_label)) stop("Section bundle run label does not match requested run label.", call. = FALSE)
+  if (!is.null(execution_mode) && !identical(unique(coverage$execution_mode), execution_mode)) stop("Section bundle execution mode does not match requested execution mode.", call. = FALSE)
+  read_one <- function(filename, gzipped = FALSE) {
+    do.call(rbind, lapply(seq_len(nrow(coverage)), function(i) {
+      path <- file.path(coverage$section_output_dir[[i]], filename)
+      table <- if (gzipped) utils::read.delim(gzfile(path), check.names = FALSE) else utils::read.delim(path, check.names = FALSE)
+      if (!"region_id" %in% names(table)) table$region_id <- coverage$region_id[[i]]
+      table
+    }))
+  }
+  list(
+    coverage = coverage, qc_summary = read_one("qc_summary.tsv"),
+    thresholds = read_one("qc_thresholds.tsv"), gates = read_one("section_readiness_gates.tsv"),
+    alarms = read_one("analysis_alerts.tsv"), cell_metadata = read_one("cell_qc_metadata.tsv.gz", TRUE)
+  )
+}
+
+#' Write the reloadable six-region slide-level QC bundle.
+write_colon_slide_qc_bundle <- function(project_root, output_dir, run_label, execution_mode,
+                                        slide_data, slide_summary, position_summary) {
+  assert_path_within(project_root, output_dir)
+  if (!grepl("/colon_analysis/", canonical_path(output_dir), fixed = TRUE)) stop("Slide output must be below colon_analysis.", call. = FALSE)
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  write_tsv(slide_data$coverage, file.path(output_dir, "section_coverage.tsv"), project_root)
+  write_tsv(slide_summary$section_summary, file.path(output_dir, "section_qc_summary.tsv"), project_root)
+  write_tsv(slide_summary$readiness, file.path(output_dir, "region_readiness.tsv"), project_root)
+  write_tsv(position_summary$within_mouse, file.path(output_dir, "within_mouse_position_summary.tsv"), project_root)
+  write_tsv(position_summary$matched_position, file.path(output_dir, "matched_position_summary.tsv"), project_root)
+  object <- list(run_label = run_label, execution_mode = execution_mode, slide_data = slide_data, slide_summary = slide_summary, position_summary = position_summary)
+  saveRDS(object, file.path(output_dir, "colon_slide_qc.rds"), compress = "xz")
+  slide_plots <- plot_slide_qc(slide_data, slide_summary)
+  figure_dir <- file.path(output_dir, "figures")
+  dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+  pdf_path <- file.path(figure_dir, "colon_slide_qc_figures.pdf")
+  grDevices::pdf(pdf_path, width = 8, height = 5.5, onefile = TRUE)
+  for (plot in slide_plots) print(plot)
+  grDevices::dev.off()
+  invisible(vapply(names(slide_plots), function(name) {
+    path <- file.path(figure_dir, paste0("slide_", name, ".png"))
+    ggplot2::ggsave(path, slide_plots[[name]], width = 8, height = 5.5, units = "in", dpi = 300, bg = "white")
+    path
+  }, character(1)))
+  writeLines(capture.output(sessionInfo()), file.path(output_dir, "session_info.txt"), useBytes = TRUE)
+  data.frame(run_label = run_label, execution_mode = execution_mode, regions = nrow(slide_data$coverage), overall_status = slide_summary$overall_status)
+}
+
+#' Reload and validate the saved six-region slide bundle.
+validate_colon_slide_qc_bundle <- function(output_dir, expected_regions = expected_colon_regions(), stop_on_error = TRUE) {
+  required <- c(
+    "section_coverage.tsv", "section_qc_summary.tsv", "region_readiness.tsv",
+    "within_mouse_position_summary.tsv", "matched_position_summary.tsv",
+    "colon_slide_qc.rds", "session_info.txt", file.path("figures", "colon_slide_qc_figures.pdf"),
+    file.path("figures", paste0("slide_", c("cell_yield", "counts", "features", "review", "flags", "thresholds"), ".png"))
+  )
+  paths <- file.path(output_dir, required)
+  valid <- all(file.exists(paths))
+  if (valid) {
+    object <- tryCatch(readRDS(file.path(output_dir, "colon_slide_qc.rds")), error = identity)
+    valid <- !inherits(object, "error") && identical(as.character(object$slide_data$coverage$region_id), expected_regions)
+  }
+  if (!valid && isTRUE(stop_on_error)) stop("Colon slide QC bundle failed artifact or reload validation.", call. = FALSE)
+  valid
+}
+
 plot_extended_spatial_qc <- function(spatial_cells, spatial_edge_density, spatial_hotspots, region_id) {
   require_package("ggplot2")
   validate_spatial_cells(spatial_cells)

@@ -14,19 +14,30 @@ headings <- c("## Goal", "## Setup", "## Inputs and integrity", "## Cell QC", "#
 for (index in seq_along(regions)) {
   path <- file.path("notebooks", sprintf("01_QC_Region%d.ipynb", index))
   stopifnot(file.exists(path))
+  raw_json <- paste(readLines(path, warn = FALSE, encoding = "UTF-8"), collapse = "\n")
+  # Jupyter nbformat requires every cell metadata field to be a JSON object.
+  # jsonlite serializes an unnamed empty R list as [], which Jupyter rejects.
+  stopifnot(!grepl('"metadata": []', raw_json, fixed = TRUE))
   notebook <- read_notebook(path)
   text <- cell_text(notebook)
+  cell_ids <- vapply(notebook$cells, function(cell) if (is.null(cell$id)) NA_character_ else cell$id, character(1))
+  stopifnot(!anyNA(cell_ids), !anyDuplicated(cell_ids), all(grepl("^[A-Za-z0-9_-]{1,64}$", cell_ids)))
   stopifnot(identical(notebook$metadata$kernelspec$name, "ir"))
   stopifnot(grepl(sprintf('REGION_ID <- "%s"', regions[[index]]), text, fixed = TRUE))
   stopifnot(all(vapply(headings, grepl, logical(1), x = text, fixed = TRUE)))
   stopifnot(grepl("FULL_HPC", text, fixed = TRUE), grepl("LOCAL_SUBSET", text, fixed = TRUE))
   stopifnot(grepl("fixed_cell_qc_thresholds.tsv", text, fixed = TRUE), grepl("primary_include", text, fixed = TRUE))
+  stopifnot(grepl("Full-data HPC output - not this local subset - determines final readiness.", text, fixed = TRUE))
   stopifnot(!grepl("scWAT", text, fixed = TRUE), !grepl("adipose_analysis", text, fixed = TRUE))
   assert_cleared(notebook)
 }
 
 summary <- read_notebook(file.path("notebooks", "02_slide_QC_summary.ipynb"))
+summary_raw_json <- paste(readLines(file.path("notebooks", "02_slide_QC_summary.ipynb"), warn = FALSE, encoding = "UTF-8"), collapse = "\n")
+stopifnot(!grepl('"metadata": []', summary_raw_json, fixed = TRUE))
 summary_text <- cell_text(summary)
+summary_cell_ids <- vapply(summary$cells, function(cell) if (is.null(cell$id)) NA_character_ else cell$id, character(1))
+stopifnot(!anyNA(summary_cell_ids), !anyDuplicated(summary_cell_ids), all(grepl("^[A-Za-z0-9_-]{1,64}$", summary_cell_ids)))
 stopifnot(grepl("expected_colon_regions()", summary_text, fixed = TRUE))
 stopifnot(grepl("summarise_colon_mouse_position", summary_text, fixed = TRUE))
 stopifnot(all(vapply(c("Mouse_1", "Mouse_2", "top", "middle", "bottom"), grepl, logical(1), x = summary_text, fixed = TRUE)))
@@ -37,6 +48,7 @@ cat("Seven colon notebook contracts passed.\n")
 
 launcher_files <- c(
   file.path("scripts", "execute_local_subset.ps1"),
+  file.path("scripts", "validate_notebooks.py"),
   file.path("shell", "run_notebook_qc_hpc.sh"),
   file.path("slurm", "colon_notebook_qc.sbatch"),
   "README.md"

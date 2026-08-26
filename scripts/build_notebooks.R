@@ -9,16 +9,23 @@ repo_root <- if (length(args)) normalizePath(args[[1L]], winslash = "/", mustWor
 notebook_dir <- file.path(repo_root, "notebooks")
 dir.create(notebook_dir, recursive = TRUE, showWarnings = FALSE)
 
-markdown_cell <- function(text) list(cell_type = "markdown", metadata = list(), source = text)
-code_cell <- function(text) list(cell_type = "code", execution_count = NULL, metadata = list(), outputs = list(), source = text)
-notebook <- function(cells) list(
-  cells = cells,
-  metadata = list(
-    kernelspec = list(display_name = "R", language = "R", name = "ir"),
-    language_info = list(name = "R", mimetype = "text/x-r-source", file_extension = ".r")
-  ),
-  nbformat = 4L, nbformat_minor = 5L
-)
+# An empty *named* list serializes as the JSON object {}. An unnamed empty
+# list serializes as [], which violates nbformat's cell.metadata mapping type.
+empty_json_object <- function() structure(list(), names = character())
+markdown_cell <- function(text) list(cell_type = "markdown", metadata = empty_json_object(), source = text)
+code_cell <- function(text) list(cell_type = "code", execution_count = NULL, metadata = empty_json_object(), outputs = list(), source = text)
+notebook <- function(cells) {
+  # nbformat 4.5 requires a unique, 1-64 character ID on every cell.
+  for (index in seq_along(cells)) cells[[index]]$id <- sprintf("cell-%03d", index)
+  list(
+    cells = cells,
+    metadata = list(
+      kernelspec = list(display_name = "R", language = "R", name = "ir"),
+      language_info = list(name = "R", mimetype = "text/x-r-source", file_extension = ".r")
+    ),
+    nbformat = 4L, nbformat_minor = 5L
+  )
+}
 
 region_cells <- function(region_id) {
   region_number <- sub("Region_", "", region_id, fixed = TRUE)
@@ -39,7 +46,7 @@ region_cells <- function(region_id) {
     code_cell("cell_qc <- calculate_xenium_cell_qc(bundle$counts, bundle$cells, REGION_ID, fixed_thresholds)\nmasks <- build_cell_downstream_masks(cell_qc$cell_metadata, provenance = paste(RUN_LABEL, EXECUTION_MODE, sep = \"::\"))\nstopifnot(nrow(masks) == ncol(bundle$counts), all(!masks$strict_include | masks$primary_include))\ntable(primary_include = masks$primary_include, strict_include = masks$strict_include)"),
     markdown_cell("## Outputs and checks\n\nWrite an auditable region bundle beneath the run root: sparse raw counts, all cell metadata and masks, thresholds, inventory/integrity, run configuration, readiness evidence, and session information. The source notebook stays output-free; executed copies belong under the run directory."),
     code_cell("section_output_dir <- file.path(RUN_ROOT, \"sections\", REGION_ID)\nresult <- write_colon_region_qc_bundle(\n  project_root = PROJECT_ROOT, output_dir = section_output_dir, region_id = REGION_ID,\n  run_label = RUN_LABEL, execution_mode = EXECUTION_MODE, manifest = manifest,\n  inventory = inventory, integrity = integrity, bundle = bundle, cell_qc = cell_qc, masks = masks\n)\nstopifnot(validate_colon_region_qc_bundle(section_output_dir, REGION_ID))\nresult"),
-    markdown_cell("## Next steps\n\nReview region tables and figures, especially assignment/control burden, boundary counts, segmentation flags, and spatial hotspots. A `PASS` here is technical evidence only. After all six regions finish under the same run label and mode, execute `02_slide_QC_summary.ipynb`. Full-data HPC output—not this local subset—determines final readiness.")
+    markdown_cell("## Next steps\n\nReview region tables and figures, especially assignment/control burden, boundary counts, segmentation flags, and spatial hotspots. A `PASS` here is technical evidence only. After all six regions finish under the same run label and mode, execute `02_slide_QC_summary.ipynb`. Full-data HPC output - not this local subset - determines final readiness.")
   )
 }
 

@@ -19,8 +19,10 @@ case "$MODE" in ALL|SUMMARY|Region_1|Region_2|Region_3|Region_4|Region_5|Region_
 [[ "$RUN_ROOT" == "$PROJECT_ROOT/colon_analysis/"* ]] || { echo "Unsafe run root" >&2; exit 2; }
 [[ "$TEMP_ROOT" == "$PROJECT_ROOT/colon_analysis/"* ]] || { echo "Unsafe temp root" >&2; exit 2; }
 command -v Rscript >/dev/null
+command -v python3 >/dev/null
 mkdir -p "$RUN_ROOT/executed_notebooks" "$TEMP_ROOT"
 
+python3 "$PIPELINE_REPO/scripts/validate_notebooks.py" --require-nbformat "$PIPELINE_REPO"/notebooks/*.ipynb
 Rscript -e 'required <- c("Matrix","jsonlite","ggplot2","arrow","dplyr","RANN"); missing <- required[!vapply(required, requireNamespace, logical(1), quietly=TRUE)]; if(length(missing)) stop(paste("Missing R packages:", paste(missing, collapse=", ")))' 
 for region in {1..6}; do
   compgen -G "$INPUT_ROOT/output-*__Region_${region}__*" >/dev/null || { echo "Missing Region_${region} input" >&2; exit 2; }

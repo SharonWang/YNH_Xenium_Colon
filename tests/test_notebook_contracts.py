@@ -16,6 +16,9 @@ def test_region_notebooks():
         assert path.exists(), path
         notebook = json.loads(path.read_text(encoding="utf-8"))
         text = source_text(notebook)
+        assert all(isinstance(cell.get("metadata"), dict) for cell in notebook["cells"])
+        cell_ids = [cell.get("id") for cell in notebook["cells"]]
+        assert all(cell_ids) and len(cell_ids) == len(set(cell_ids))
         assert notebook["metadata"]["kernelspec"]["name"] == "ir"
         assert f'REGION_ID <- "{region}"' in text
         assert "FULL_HPC" in text and "LOCAL_SUBSET" in text
@@ -33,6 +36,9 @@ def test_summary_notebook():
     path = NOTEBOOKS / "02_slide_QC_summary.ipynb"
     notebook = json.loads(path.read_text(encoding="utf-8"))
     text = source_text(notebook)
+    assert all(isinstance(cell.get("metadata"), dict) for cell in notebook["cells"])
+    cell_ids = [cell.get("id") for cell in notebook["cells"]]
+    assert all(cell_ids) and len(cell_ids) == len(set(cell_ids))
     assert "expected_colon_regions()" in text
     assert "summarise_colon_mouse_position" in text
     assert "Mouse_1" in text and "Mouse_2" in text

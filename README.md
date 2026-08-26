@@ -43,6 +43,8 @@ Chunk 2 — confirm the site-provided runtime and packages (no installation):
 
 ```bash
 command -v Rscript
+command -v python3
+python3 scripts/validate_notebooks.py --require-nbformat notebooks/*.ipynb
 Rscript -e 'required <- c("Matrix","jsonlite","ggplot2","arrow","dplyr","RANN"); print(data.frame(package=required, available=vapply(required, requireNamespace, logical(1), quietly=TRUE))); stopifnot(all(vapply(required, requireNamespace, logical(1), quietly=TRUE)))'
 ```
 

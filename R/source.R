@@ -11965,6 +11965,52 @@ compare_binary_cell_definitions <- function(
   )
 }
 
+#' Validate an ordered manual Swiss-roll trace definition.
+#'
+#' Manual tracing is an explicit biological annotation step. This validator
+#' prevents silently reordered, incomplete, duplicated, or non-finite control
+#' points from entering interpolation and projection.
+#'
+#' @param control_points Data frame with `point_order`, `x`, `y`, and `comment`.
+#' @return One-row data frame containing trace-control and segment diagnostics.
+validate_trace_control_points <- function(control_points) {
+  require_columns(
+    control_points,
+    c("point_order", "x", "y", "comment"),
+    "control_points"
+  )
+  if (nrow(control_points) < 2L) {
+    stop("control_points must contain at least two points", call. = FALSE)
+  }
+  expected_order <- seq_len(nrow(control_points))
+  if (!identical(as.integer(control_points$point_order), expected_order)) {
+    stop("point_order must be consecutive integers starting at 1", call. = FALSE)
+  }
+  if (!is.numeric(control_points$x) || !is.numeric(control_points$y) ||
+      any(!is.finite(control_points$x)) || any(!is.finite(control_points$y))) {
+    stop("trace x and y coordinates must be finite numeric values", call. = FALSE)
+  }
+  if (anyDuplicated(control_points[c("x", "y")])) {
+    stop("trace control-point coordinates must be unique", call. = FALSE)
+  }
+  if (any(!nzchar(trimws(as.character(control_points$comment))))) {
+    stop("every trace control point must have a non-empty comment", call. = FALSE)
+  }
+
+  segment_length <- sqrt(diff(control_points$x)^2 + diff(control_points$y)^2)
+  data.frame(
+    n_control_points = as.integer(nrow(control_points)),
+    start_x = control_points$x[[1L]],
+    start_y = control_points$y[[1L]],
+    end_x = control_points$x[[nrow(control_points)]],
+    end_y = control_points$y[[nrow(control_points)]],
+    min_segment_um = min(segment_length),
+    median_segment_um = stats::median(segment_length),
+    max_segment_um = max(segment_length),
+    stringsAsFactors = FALSE
+  )
+}
+
 #' Densify ordered manual trace control points by linear interpolation.
 #'
 #' @param control_points Data frame with ordered `x` and `y` coordinates.
@@ -12061,7 +12107,11 @@ project_cells_to_trace <- function(
     sqrt((trace$x - center[["x"]])^2 + (trace$y - center[["y"]])^2)
   }
 
-  result <- vector("list", nrow(cells))
+  n_cells <- nrow(cells)
+  accepted_index <- rep(NA_integer_, n_cells)
+  accepted_arc_length <- rep(NA_real_, n_cells)
+  accepted_arc_fraction <- rep(NA_real_, n_cells)
+  accepted_wall_distance <- rep(NA_real_, n_cells)
   for (i in seq_len(nrow(cells))) {
     dx <- trace$x - cells$x[[i]]
     dy <- trace$y - cells$y[[i]]
@@ -12077,24 +12127,27 @@ project_cells_to_trace <- function(
     }
 
     if (!any(eligible)) {
-      result[[i]] <- data.frame(
-        trace_index = NA_integer_, roll_arc_length = NA_real_,
-        roll_arc_fraction = NA_real_, wall_distance = NA_real_
-      )
       next
     }
 
     accepted <- which(eligible)
     trace_index <- accepted[[which.min(distance[eligible])]]
-    result[[i]] <- data.frame(
-      trace_index = as.integer(trace_index),
-      roll_arc_length = trace$roll_arc_length[[trace_index]],
-      roll_arc_fraction = trace$roll_arc_fraction[[trace_index]],
-      wall_distance = distance[[trace_index]]
-    )
+    accepted_index[[i]] <- as.integer(trace_index)
+    accepted_arc_length[[i]] <- trace$roll_arc_length[[trace_index]]
+    accepted_arc_fraction[[i]] <- trace$roll_arc_fraction[[trace_index]]
+    accepted_wall_distance[[i]] <- distance[[trace_index]]
   }
 
-  cbind(cells, do.call(rbind, result), row.names = NULL)
+  cbind(
+    cells,
+    data.frame(
+      trace_index = accepted_index,
+      roll_arc_length = accepted_arc_length,
+      roll_arc_fraction = accepted_arc_fraction,
+      wall_distance = accepted_wall_distance
+    ),
+    row.names = NULL
+  )
 }
 
 #' Assess continuity of an ordered trace.

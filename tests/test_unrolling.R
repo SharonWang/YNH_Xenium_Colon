@@ -80,6 +80,26 @@ testthat::test_that("ordered control points are interpolated at the requested sp
   testthat::expect_equal(observed$y, c(0, 0, 0, 0))
 })
 
+testthat::test_that("manual trace controls require finite sequential reviewed points", {
+  controls <- data.frame(
+    point_order = 1:3,
+    x = c(10, 20, 30),
+    y = c(40, 50, 60),
+    comment = c("outer edge", "middle turn", "inner endpoint")
+  )
+
+  observed <- validate_trace_control_points(controls)
+
+  testthat::expect_equal(observed$n_control_points, 3L)
+  testthat::expect_equal(observed$start_x, 10)
+  testthat::expect_equal(observed$end_y, 60)
+  broken <- controls[c(1, 3), ]
+  testthat::expect_error(
+    validate_trace_control_points(broken),
+    "point_order must be consecutive"
+  )
+})
+
 testthat::test_that("cumulative arc length starts at zero and follows the ordered trace", {
   trace <- data.frame(x = c(0, 3, 3), y = c(0, 0, 4))
   observed <- add_trace_arc_length(trace)

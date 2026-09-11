@@ -37,24 +37,24 @@ input_default <- file.path(
 input_rds <- Sys.getenv("COLON_REGION6_RDS", unset = input_default)
 trace_tsv <- Sys.getenv(
   "COLON_REGION6_TRACE",
-  unset = file.path(
-    analysis_root, "mayassi_unrolling_spike", "Region_6",
-    "Region_6_trace_control_points.tsv"
-  )
+  unset = file.path(repo_root, "config", "unrolling", "Region_6_trace_control_points.tsv")
 )
 output_dir <- Sys.getenv(
   "COLON_UNROLL_OUTPUT",
   unset = file.path(analysis_root, "mayassi_unrolling_spike", "Region_6")
 )
-max_cells <- as.integer(Sys.getenv("COLON_UNROLL_MAX_CELLS", unset = "12000"))
+max_cells <- as.integer(Sys.getenv(
+  "COLON_UNROLL_MAX_CELLS",
+  unset = if (.Platform$OS.type == "windows") "12000" else "0"
+))
 
 required_paths <- c(repo_root, input_rds, trace_tsv)
 missing_paths <- required_paths[!file.exists(required_paths)]
 if (length(missing_paths) > 0L) {
   stop("Required path(s) missing: ", paste(missing_paths, collapse = "; "), call. = FALSE)
 }
-if (!is.finite(max_cells) || max_cells < 100L) {
-  stop("COLON_UNROLL_MAX_CELLS must be an integer of at least 100", call. = FALSE)
+if (!is.finite(max_cells) || max_cells < 0L || (max_cells > 0L && max_cells < 100L)) {
+  stop("COLON_UNROLL_MAX_CELLS must be 0 for all cells or at least 100", call. = FALSE)
 }
 
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
@@ -65,26 +65,36 @@ message("Reading Region 6 object: ", input_rds)
 region6 <- readRDS(input_rds)
 metadata <- region6[[]]
 
-coordinate_columns <- c("x_centroid", "y_centroid")
-missing_columns <- setdiff(coordinate_columns, names(metadata))
+required_metadata <- c(
+  "x_centroid", "y_centroid", "primary_include_revised",
+  "RefAll_subtype_predicted.id"
+)
+missing_columns <- setdiff(required_metadata, names(metadata))
 if (length(missing_columns) > 0L) {
   stop(
     "Region 6 metadata is missing: ", paste(missing_columns, collapse = ", "),
     call. = FALSE
   )
 }
+if (any(!(metadata[["primary_include_revised"]] %in% TRUE))) {
+  stop("Region_6_spatial_passQC.rds contains cells not passing primary_include_revised", call. = FALSE)
+}
 
 cells <- data.frame(
   cell_id = extract_cell_ids(metadata),
   x = as.numeric(metadata[["x_centroid"]]),
   y = as.numeric(metadata[["y_centroid"]]),
-  smooth_muscle = as.character(metadata[["Xenium_cluster_subtype"]]) == "Smooth_muscle"
+  smooth_muscle_reference =
+    as.character(metadata[["RefAll_subtype_predicted.id"]]) == "Smooth muscle"
 )
-cells <- cells[stats::complete.cases(cells[, c("x", "y")]), , drop = FALSE]
+cells <- cells[
+  stats::complete.cases(cells[, c("cell_id", "x", "y", "smooth_muscle_reference")]),
+  , drop = FALSE
+]
 
 # A fixed seed makes the local feasibility subset exactly reproducible.
 set.seed(20260910)
-if (nrow(cells) > max_cells) {
+if (max_cells > 0L && nrow(cells) > max_cells) {
   selected <- sort(sample.int(nrow(cells), max_cells, replace = FALSE))
   cells_pilot <- cells[selected, , drop = FALSE]
 } else {
@@ -95,7 +105,7 @@ if (nrow(cells) > max_cells) {
 # smooth-muscle guide. Linear densification is the coordinate-space equivalent
 # of extracting the ordered green-pixel path in the authors' released script.
 control <- utils::read.delim(trace_tsv, check.names = FALSE)
-control <- control[order(control[["point_order"]]), , drop = FALSE]
+validate_trace_control_points(control)
 trace <- interpolate_trace_control_points(control[, c("x", "y")], spacing = 20)
 trace <- add_trace_arc_length(trace)
 
@@ -130,8 +140,8 @@ projected$projection_changed_by_constraint <-
   projected$trace_index != projected$unconstrained_trace_index
 
 valid <- !is.na(projected$trace_index)
-smooth_valid <- valid & projected$smooth_muscle
-other_valid <- valid & !projected$smooth_muscle
+smooth_valid <- valid & projected$smooth_muscle_reference
+other_valid <- valid & !projected$smooth_muscle_reference
 trace_quality <- assess_trace_quality(trace)
 
 metrics <- data.frame(
@@ -163,7 +173,14 @@ metrics <- data.frame(
 
 write_tsv_gz(
   projected,
-  file.path(output_dir, "Region_6_unrolled_pilot_cells.tsv.gz")
+  file.path(
+    output_dir,
+    if (max_cells == 0L) {
+      "Region_6_passQC_unrolled_cells.tsv.gz"
+    } else {
+      "Region_6_passQC_unrolled_subset_cells.tsv.gz"
+    }
+  )
 )
 utils::write.table(
   trace,
@@ -179,7 +196,7 @@ utils::write.table(
 guide_plot <- ggplot(cells, aes(x = x, y = y)) +
   geom_point(color = "grey82", size = 0.06, alpha = 0.20) +
   geom_point(
-    data = cells[cells$smooth_muscle, , drop = FALSE],
+    data = cells[cells$smooth_muscle_reference, , drop = FALSE],
     color = "black", size = 0.08, alpha = 0.35
   ) +
   geom_path(data = trace, color = "#00A651", linewidth = 0.55) +
@@ -200,12 +217,12 @@ unrolled_plot <- ggplot(
   projected[valid, , drop = FALSE],
   aes(x = roll_arc_fraction, y = wall_distance)
 ) +
-  geom_point(aes(color = smooth_muscle), size = 0.20, alpha = 0.40) +
+  geom_point(aes(color = smooth_muscle_reference), size = 0.20, alpha = 0.40) +
   scale_color_manual(values = c(`FALSE` = "grey65", `TRUE` = "#111111")) +
   labs(
     x = "Unoriented roll arc fraction (outer trace start to inner endpoint)",
     y = "Distance to accepted trace point",
-    color = "Smooth muscle",
+    color = "Mayassi-reference\nSmooth muscle",
     title = "Region 6 unrolled coordinate map"
   ) +
   theme_bw(base_size = 10)

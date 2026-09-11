@@ -10680,3 +10680,1883 @@ plot_eos_with_celltypes <- function(
 
   p
 }
+
+create_spatial_seurat_from_xenium <- function(
+    xenium_dir,
+    genes = NULL,
+    cells = NULL,
+    project = NULL,
+    assay = "Xenium",
+    fov = "fov",
+    include_cell_segmentation = TRUE,
+    include_nucleus_segmentation = TRUE
+) {
+
+  # ============================================================
+  # 0. Basic checks
+  # ============================================================
+
+  if (!dir.exists(xenium_dir)) {
+    stop(
+      "xenium_dir does not exist: ",
+      xenium_dir,
+      call. = FALSE
+    )
+  }
+
+  if (is.null(project)) {
+    project <- basename(
+      normalizePath(
+        xenium_dir,
+        winslash = "/",
+        mustWork = TRUE
+      )
+    )
+  }
+
+  message("Reading Xenium output directly from:")
+  message("  ", xenium_dir)
+
+
+  # ============================================================
+  # 1. Read native Xenium count matrix
+  # ============================================================
+
+  h5_path <- file.path(
+    xenium_dir,
+    "cell_feature_matrix.h5"
+  )
+
+  matrix_dir <- file.path(
+    xenium_dir,
+    "cell_feature_matrix"
+  )
+
+  if (file.exists(h5_path)) {
+
+    message("Reading cell_feature_matrix.h5 ...")
+
+    counts_raw <- Seurat::Read10X_h5(
+      filename = h5_path,
+      use.names = TRUE,
+      unique.features = TRUE
+    )
+
+  } else if (dir.exists(matrix_dir)) {
+
+    message("Reading cell_feature_matrix/ directory ...")
+
+    counts_raw <- Seurat::Read10X(
+      data.dir = matrix_dir,
+      gene.column = 2
+    )
+
+  } else {
+
+    stop(
+      paste0(
+        "Could not find either:\n",
+        "  cell_feature_matrix.h5\n",
+        "or\n",
+        "  cell_feature_matrix/\n",
+        "inside:\n",
+        xenium_dir
+      ),
+      call. = FALSE
+    )
+  }
+
+
+  # ============================================================
+  # 2. Handle feature-type list if Read10X returns one
+  # ============================================================
+
+  if (is.list(counts_raw)) {
+
+    message(
+      "Read10X returned feature types: ",
+      paste(
+        names(counts_raw),
+        collapse = ", "
+      )
+    )
+
+    if ("Gene Expression" %in% names(counts_raw)) {
+
+      counts <- counts_raw[["Gene Expression"]]
+
+    } else if ("GeneExpression" %in% names(counts_raw)) {
+
+      counts <- counts_raw[["GeneExpression"]]
+
+    } else {
+
+      # Show available names rather than silently guessing
+      stop(
+        "Could not identify Gene Expression matrix. ",
+        "Available entries: ",
+        paste(
+          names(counts_raw),
+          collapse = ", "
+        ),
+        call. = FALSE
+      )
+    }
+
+  } else {
+
+    counts <- counts_raw
+  }
+
+  rm(counts_raw)
+  invisible(gc())
+
+
+  if (!inherits(counts, "sparseMatrix")) {
+    counts <- methods::as(
+      counts,
+      "dgCMatrix"
+    )
+  }
+
+  if (is.null(rownames(counts)) ||
+      is.null(colnames(counts))) {
+
+    stop(
+      "Xenium count matrix lacks gene/cell names.",
+      call. = FALSE
+    )
+  }
+
+
+  message(
+    "Native matrix: ",
+    format(nrow(counts), big.mark = ","),
+    " features × ",
+    format(ncol(counts), big.mark = ","),
+    " cells"
+  )
+
+
+  # ============================================================
+  # 3. Read native Xenium cell metadata
+  # ============================================================
+
+  cells_parquet <- file.path(
+    xenium_dir,
+    "cells.parquet"
+  )
+
+  cells_csv <- file.path(
+    xenium_dir,
+    "cells.csv.gz"
+  )
+
+  if (file.exists(cells_parquet)) {
+
+    if (!requireNamespace(
+      "arrow",
+      quietly = TRUE
+    )) {
+      stop(
+        "Package 'arrow' is required to read cells.parquet.",
+        call. = FALSE
+      )
+    }
+
+    message("Reading cells.parquet ...")
+
+    metadata <- arrow::read_parquet(
+      cells_parquet,
+      as_data_frame = TRUE
+    )
+
+  } else if (file.exists(cells_csv)) {
+
+    message("Reading cells.csv.gz ...")
+
+    metadata <- read.csv(
+      cells_csv,
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+
+  } else {
+
+    stop(
+      "Neither cells.parquet nor cells.csv.gz was found.",
+      call. = FALSE
+    )
+  }
+
+
+  # ============================================================
+  # 4. Validate native metadata
+  # ============================================================
+
+  required_meta <- c(
+    "cell_id",
+    "x_centroid",
+    "y_centroid"
+  )
+
+  missing_meta <- setdiff(
+    required_meta,
+    colnames(metadata)
+  )
+
+  if (length(missing_meta)) {
+    stop(
+      "Missing required Xenium cell columns: ",
+      paste(
+        missing_meta,
+        collapse = ", "
+      ),
+      call. = FALSE
+    )
+  }
+
+  metadata$cell_id <- as.character(
+    metadata$cell_id
+  )
+
+  if (anyDuplicated(metadata$cell_id)) {
+    stop(
+      "Duplicated cell IDs in Xenium metadata.",
+      call. = FALSE
+    )
+  }
+
+
+  # ============================================================
+  # 5. Align native matrix and metadata
+  # ============================================================
+
+  common_cells <- intersect(
+    colnames(counts),
+    metadata$cell_id
+  )
+
+  message(
+    "Matrix/metadata overlapping cells: ",
+    format(
+      length(common_cells),
+      big.mark = ","
+    )
+  )
+
+  if (!length(common_cells)) {
+
+    stop(
+      paste0(
+        "No overlapping cell IDs between ",
+        "cell_feature_matrix and cells metadata.\n",
+        "First matrix cell: ",
+        head(colnames(counts), 1),
+        "\nFirst metadata cell: ",
+        head(metadata$cell_id, 1)
+      ),
+      call. = FALSE
+    )
+  }
+
+
+  # Optional explicit cell subset
+  if (!is.null(cells)) {
+
+    cells <- unique(
+      as.character(cells)
+    )
+
+    common_cells <- intersect(
+      common_cells,
+      cells
+    )
+
+    if (!length(common_cells)) {
+      stop(
+        "No requested cells remain.",
+        call. = FALSE
+      )
+    }
+  }
+
+
+  counts <- counts[
+    ,
+    common_cells,
+    drop = FALSE
+  ]
+
+  metadata <- metadata[
+    match(
+      common_cells,
+      metadata$cell_id
+    ),
+    ,
+    drop = FALSE
+  ]
+
+  rownames(metadata) <- metadata$cell_id
+
+
+  stopifnot(
+    identical(
+      colnames(counts),
+      rownames(metadata)
+    )
+  )
+
+
+  # ============================================================
+  # 6. Optional gene subset
+  # ============================================================
+
+  if (!is.null(genes)) {
+
+    genes <- unique(
+      as.character(genes)
+    )
+
+    genes_present <- intersect(
+      genes,
+      rownames(counts)
+    )
+
+    genes_missing <- setdiff(
+      genes,
+      rownames(counts)
+    )
+
+    message(
+      "Requested genes present: ",
+      length(genes_present),
+      "/",
+      length(genes)
+    )
+
+    if (length(genes_missing)) {
+
+      message(
+        "Missing genes: ",
+        paste(
+          head(genes_missing, 20),
+          collapse = ", "
+        )
+      )
+    }
+
+    if (!length(genes_present)) {
+      stop(
+        "None of the requested genes are present.",
+        call. = FALSE
+      )
+    }
+
+    counts <- counts[
+      genes_present,
+      ,
+      drop = FALSE
+    ]
+  }
+
+
+  # ============================================================
+  # 7. Create Seurat object
+  # ============================================================
+
+  object <- Seurat::CreateSeuratObject(
+    counts = counts,
+    meta.data = metadata,
+    assay = assay,
+    project = project,
+    min.cells = 0,
+    min.features = 0
+  )
+
+
+  # ============================================================
+  # 8. Add Xenium centroids
+  # ============================================================
+
+  centroids <- data.frame(
+    x = as.numeric(metadata$x_centroid),
+    y = as.numeric(metadata$y_centroid),
+    row.names = metadata$cell_id,
+    check.names = FALSE
+  )
+
+  spatial_centroids <-
+    SeuratObject::CreateCentroids(
+      coords = centroids
+    )
+
+  spatial_fov <-
+    SeuratObject::CreateFOV(
+      coords = spatial_centroids,
+      type = "centroids",
+      molecules = NULL,
+      assay = assay,
+      key = paste0(fov, "_")
+    )
+
+  object[[fov]] <- spatial_fov
+
+
+  # ============================================================
+  # 9. Helper to read native Xenium boundaries
+  # ============================================================
+
+  read_xenium_boundary <- function(
+      path,
+      selected_cells
+  ) {
+
+    if (!file.exists(path)) {
+      return(NULL)
+    }
+
+    if (!requireNamespace(
+      "arrow",
+      quietly = TRUE
+    )) {
+      stop(
+        "Package 'arrow' required for Xenium polygons.",
+        call. = FALSE
+      )
+    }
+
+    boundary <- arrow::read_parquet(
+      path,
+      as_data_frame = TRUE
+    )
+
+    if (!"cell_id" %in% colnames(boundary)) {
+      stop(
+        "Boundary file lacks cell_id: ",
+        basename(path),
+        call. = FALSE
+      )
+    }
+
+
+    # Xenium versions can differ slightly
+    x_candidates <- c(
+      "vertex_x",
+      "x",
+      "x_location",
+      "x_centroid"
+    )
+
+    y_candidates <- c(
+      "vertex_y",
+      "y",
+      "y_location",
+      "y_centroid"
+    )
+
+    x_col <- intersect(
+      x_candidates,
+      colnames(boundary)
+    )
+
+    y_col <- intersect(
+      y_candidates,
+      colnames(boundary)
+    )
+
+    if (!length(x_col) ||
+        !length(y_col)) {
+
+      stop(
+        "Cannot identify x/y polygon columns in ",
+        basename(path),
+        call. = FALSE
+      )
+    }
+
+    x_col <- x_col[[1]]
+    y_col <- y_col[[1]]
+
+
+    boundary <- boundary[
+      as.character(boundary$cell_id) %in%
+        selected_cells,
+      ,
+      drop = FALSE
+    ]
+
+
+    polygon <- data.frame(
+      x = as.numeric(
+        boundary[[x_col]]
+      ),
+      y = as.numeric(
+        boundary[[y_col]]
+      ),
+      cell = as.character(
+        boundary$cell_id
+      ),
+      stringsAsFactors = FALSE
+    )
+
+
+    polygon <- polygon[
+      is.finite(polygon$x) &
+      is.finite(polygon$y) &
+      !is.na(polygon$cell) &
+      nzchar(polygon$cell),
+      ,
+      drop = FALSE
+    ]
+
+    polygon
+  }
+
+
+  # ============================================================
+  # 10. Native cell segmentation
+  # ============================================================
+
+  segmentation_loaded <- character()
+
+  if (isTRUE(
+    include_cell_segmentation
+  )) {
+
+    cell_boundary_path <- file.path(
+      xenium_dir,
+      "cell_boundaries.parquet"
+    )
+
+    if (file.exists(cell_boundary_path)) {
+
+      cell_polygon <- read_xenium_boundary(
+        cell_boundary_path,
+        selected_cells = colnames(object)
+      )
+
+      message(
+        "Creating cell segmentation: ",
+        format(
+          nrow(cell_polygon),
+          big.mark = ","
+        ),
+        " vertices"
+      )
+
+      cell_segmentation <-
+        SeuratObject::CreateSegmentation(
+          coords = cell_polygon,
+          compact = TRUE
+        )
+
+      object[[fov]][["segmentation"]] <-
+        cell_segmentation
+
+      segmentation_loaded <- c(
+        segmentation_loaded,
+        "segmentation"
+      )
+
+      rm(
+        cell_polygon,
+        cell_segmentation
+      )
+
+      invisible(gc())
+
+    } else {
+
+      warning(
+        "cell_boundaries.parquet not found.",
+        call. = FALSE
+      )
+    }
+  }
+
+
+  # ============================================================
+  # 11. Native nucleus segmentation
+  # ============================================================
+
+  if (isTRUE(
+    include_nucleus_segmentation
+  )) {
+
+    nucleus_boundary_path <- file.path(
+      xenium_dir,
+      "nucleus_boundaries.parquet"
+    )
+
+    if (file.exists(
+      nucleus_boundary_path
+    )) {
+
+      nucleus_polygon <- read_xenium_boundary(
+        nucleus_boundary_path,
+        selected_cells = colnames(object)
+      )
+
+      message(
+        "Creating nucleus segmentation: ",
+        format(
+          nrow(nucleus_polygon),
+          big.mark = ","
+        ),
+        " vertices"
+      )
+
+      nucleus_segmentation <-
+        SeuratObject::CreateSegmentation(
+          coords = nucleus_polygon,
+          compact = TRUE
+        )
+
+      object[[fov]][["nucleus_segmentation"]] <-
+        nucleus_segmentation
+
+      segmentation_loaded <- c(
+        segmentation_loaded,
+        "nucleus_segmentation"
+      )
+
+      rm(
+        nucleus_polygon,
+        nucleus_segmentation
+      )
+
+      invisible(gc())
+
+    } else {
+
+      warning(
+        "nucleus_boundaries.parquet not found.",
+        call. = FALSE
+      )
+    }
+  }
+
+
+  # ============================================================
+  # 12. FOV defaults
+  # ============================================================
+
+  SeuratObject::DefaultFOV(object) <- fov
+
+  available_boundaries <-
+    SeuratObject::Boundaries(
+      object[[fov]]
+    )
+
+  if ("centroids" %in%
+      available_boundaries) {
+
+    SeuratObject::DefaultBoundary(
+      object[[fov]]
+    ) <- "centroids"
+  }
+
+
+  # ============================================================
+  # 13. Provenance
+  # ============================================================
+
+  object@misc$xenium_import <- list(
+
+    source =
+      "NATIVE_XENIUM_OUTPUT",
+
+    xenium_dir =
+      normalizePath(
+        xenium_dir,
+        winslash = "/",
+        mustWork = TRUE
+      ),
+
+    expression_source =
+      if (file.exists(h5_path)) {
+        "cell_feature_matrix.h5"
+      } else {
+        "cell_feature_matrix/"
+      },
+
+    metadata_source =
+      if (file.exists(cells_parquet)) {
+        "cells.parquet"
+      } else {
+        "cells.csv.gz"
+      },
+
+    genes =
+      rownames(object),
+
+    n_genes =
+      nrow(object),
+
+    n_cells =
+      ncol(object),
+
+    spatial_boundaries =
+      available_boundaries,
+
+    segmentation_loaded =
+      segmentation_loaded
+  )
+
+
+  # ============================================================
+  # 14. Final validation
+  # ============================================================
+
+  if (!identical(
+    colnames(object),
+    rownames(object@meta.data)
+  )) {
+    stop(
+      "Final Seurat/metadata alignment failed.",
+      call. = FALSE
+    )
+  }
+
+
+  spatial_cells <- Cells(
+    object[[fov]]
+  )
+
+  missing_spatial <- setdiff(
+    colnames(object),
+    spatial_cells
+  )
+
+  if (length(missing_spatial)) {
+    stop(
+      length(missing_spatial),
+      " Seurat cells missing from FOV.",
+      call. = FALSE
+    )
+  }
+
+
+  # ============================================================
+  # 15. Summary
+  # ============================================================
+
+  message("")
+  message(
+    "Created native Xenium spatial Seurat object: ",
+    project
+  )
+
+  message(
+    "  Cells: ",
+    format(
+      ncol(object),
+      big.mark = ","
+    )
+  )
+
+  message(
+    "  Genes: ",
+    format(
+      nrow(object),
+      big.mark = ","
+    )
+  )
+
+  message(
+    "  FOV: ",
+    fov
+  )
+
+  message(
+    "  Boundaries: ",
+    paste(
+      available_boundaries,
+      collapse = ", "
+    )
+  )
+
+  return(object)
+}
+
+add_masks_to_seurat <- function(
+    object,
+    masks,
+    cell_id_col = "cell_id",
+    cols = NULL,
+    overwrite = FALSE,
+    require_complete_match = FALSE
+) {
+
+  # ============================================================
+  # 1. Validate inputs
+  # ============================================================
+
+  if (!inherits(object, "Seurat")) {
+    stop("object must be a Seurat object.", call. = FALSE)
+  }
+
+  if (!cell_id_col %in% colnames(masks)) {
+    stop(
+      "masks does not contain cell ID column: ",
+      cell_id_col,
+      call. = FALSE
+    )
+  }
+
+  masks <- as.data.frame(
+    masks,
+    stringsAsFactors = FALSE
+  )
+
+  masks[[cell_id_col]] <- as.character(
+    masks[[cell_id_col]]
+  )
+
+  if (anyDuplicated(masks[[cell_id_col]])) {
+    stop(
+      "Duplicated cell IDs detected in masks.",
+      call. = FALSE
+    )
+  }
+
+
+  # ============================================================
+  # 2. Match masks to Seurat cells
+  # ============================================================
+
+  object_cells <- colnames(object)
+
+  idx <- match(
+    object_cells,
+    masks[[cell_id_col]]
+  )
+
+  n_matched <- sum(!is.na(idx))
+  n_missing <- sum(is.na(idx))
+
+  message(
+    "Seurat cells: ",
+    format(length(object_cells), big.mark = ",")
+  )
+
+  message(
+    "Matched to masks: ",
+    format(n_matched, big.mark = ",")
+  )
+
+  message(
+    "Unmatched Seurat cells: ",
+    format(n_missing, big.mark = ",")
+  )
+
+
+  if (require_complete_match && n_missing > 0) {
+
+    missing_cells <- object_cells[
+      is.na(idx)
+    ]
+
+    stop(
+      n_missing,
+      " Seurat cells were not found in masks. Examples: ",
+      paste(
+        head(missing_cells, 10),
+        collapse = ", "
+      ),
+      call. = FALSE
+    )
+  }
+
+
+  # ============================================================
+  # 3. Decide which columns to transfer
+  # ============================================================
+
+  if (is.null(cols)) {
+
+    cols <- setdiff(
+      colnames(masks),
+      cell_id_col
+    )
+
+  } else {
+
+    missing_cols <- setdiff(
+      cols,
+      colnames(masks)
+    )
+
+    if (length(missing_cols)) {
+      warning(
+        "Columns not present in masks: ",
+        paste(missing_cols, collapse = ", "),
+        call. = FALSE
+      )
+    }
+
+    cols <- intersect(
+      cols,
+      colnames(masks)
+    )
+
+    cols <- setdiff(
+      cols,
+      cell_id_col
+    )
+  }
+
+
+  # ============================================================
+  # 4. Handle columns already present in Seurat metadata
+  # ============================================================
+
+  existing_cols <- intersect(
+    cols,
+    colnames(object@meta.data)
+  )
+
+  if (length(existing_cols) && !overwrite) {
+
+    message(
+      "Skipping existing metadata columns: ",
+      paste(existing_cols, collapse = ", ")
+    )
+
+    cols <- setdiff(
+      cols,
+      existing_cols
+    )
+  }
+
+  if (!length(cols)) {
+    message("No new columns to add.")
+    return(object)
+  }
+
+
+  # ============================================================
+  # 5. Add columns in EXACT Seurat cell order
+  # ============================================================
+
+  for (v in cols) {
+
+    x <- masks[[v]][idx]
+
+    # Protect against problematic list columns
+    if (is.list(x)) {
+      warning(
+        "Column '", v,
+        "' is a list column; converting to character.",
+        call. = FALSE
+      )
+
+      x <- vapply(
+        x,
+        function(z) {
+          if (length(z) == 0 || all(is.na(z))) {
+            NA_character_
+          } else {
+            paste(z, collapse = ";")
+          }
+        },
+        character(1)
+      )
+    }
+
+    object@meta.data[[v]] <- x
+  }
+
+
+  # ============================================================
+  # 6. Verify alignment
+  # ============================================================
+
+  if (!identical(
+    rownames(object@meta.data),
+    colnames(object)
+  )) {
+    stop(
+      "Seurat metadata/cell alignment changed unexpectedly.",
+      call. = FALSE
+    )
+  }
+
+
+  # ============================================================
+  # 7. Summary
+  # ============================================================
+
+  message(
+    "Added ",
+    length(cols),
+    " metadata columns."
+  )
+
+  message(
+    "Metadata dimensions: ",
+    nrow(object@meta.data),
+    " × ",
+    ncol(object@meta.data)
+  )
+
+  return(object)
+}
+
+run_wang_transfer <- function(
+  reference,
+  query,
+  annotation_genes,
+  main_col = "Wang_main",
+  subtype_col = "Wang_subtype_harmonized",
+  prefix
+) {
+
+  DefaultAssay(reference) <- "RNA"
+
+  # Restrict features to genes present in BOTH objects
+  features_use <- Reduce(
+    intersect,
+    list(
+      annotation_genes,
+      rownames(reference),
+      rownames(query)
+    )
+  )
+
+  message(
+    prefix,
+    ": using ",
+    length(features_use),
+    " shared annotation genes"
+  )
+
+  reference <- NormalizeData(
+    reference,
+    assay = "RNA",
+    verbose = FALSE
+  )
+
+  reference <- ScaleData(
+    reference,
+    assay = "RNA",
+    features = features_use,
+    verbose = FALSE
+  )
+
+  reference <- RunPCA(
+    reference,
+    assay = "RNA",
+    features = features_use,
+    npcs = 30,
+    seed.use = 1234,
+    verbose = FALSE
+  )
+
+  anchors <- FindTransferAnchors(
+    reference = reference,
+    query = query,
+    reference.assay = "RNA",
+    query.assay = "Xenium",
+    normalization.method = "LogNormalize",
+    reduction = "pcaproject",
+    features = features_use,
+    dims = 1:30,
+    verbose = FALSE
+  )
+
+  pred_main <- TransferData(
+    anchorset = anchors,
+    refdata = reference[[main_col]][, 1],
+    dims = 1:30,
+    verbose = FALSE
+  )
+
+  pred_subtype <- TransferData(
+    anchorset = anchors,
+    refdata = reference[[subtype_col]][, 1],
+    dims = 1:30,
+    verbose = FALSE
+  )
+
+  # Rename output columns so 2.5m / 12m / all can coexist
+  colnames(pred_main) <- paste0(
+    prefix,
+    "_main_",
+    colnames(pred_main)
+  )
+
+  colnames(pred_subtype) <- paste0(
+    prefix,
+    "_subtype_",
+    colnames(pred_subtype)
+  )
+
+  list(
+    main = pred_main,
+    subtype = pred_subtype,
+    anchors = anchors,
+    features = features_use
+  )
+}
+
+# -----------------------------------------------------------------------------
+# Mayassi-style Swiss-roll unrolling and method-audit utilities (2026-09-10)
+# -----------------------------------------------------------------------------
+
+#' Require named columns in an analysis table.
+#'
+#' @param x A data frame or matrix-like object with column names.
+#' @param required Character vector of required column names.
+#' @param object_name Human-readable object name used in error messages.
+#' @return Invisibly returns `TRUE`; otherwise stops with the missing columns.
+require_columns <- function(x, required, object_name) {
+  missing <- setdiff(required, names(x))
+  if (length(missing) > 0L) {
+    stop(
+      object_name, " is missing required columns: ",
+      paste(missing, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  invisible(TRUE)
+}
+
+#' Write a tab-separated table through an explicit gzip connection.
+#'
+#' The explicit connection is required because a `.gz` suffix alone does not
+#' make `write.table()` compress its output.
+#'
+#' @param x Data frame to write.
+#' @param path Destination ending in `.tsv.gz`.
+#' @return The destination path, invisibly.
+write_tsv_gz <- function(x, path) {
+  connection <- gzfile(path, open = "wt")
+  on.exit(close(connection), add = TRUE)
+  utils::write.table(
+    x,
+    connection,
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE
+  )
+  invisible(path)
+}
+
+#' Recover unique cell identifiers from Seurat metadata.
+#'
+#' @param metadata A Seurat metadata data frame. `cell_id` is preferred when
+#'   present; otherwise the Seurat row names are used.
+#' @return A unique, non-empty character vector aligned to metadata rows.
+extract_cell_ids <- function(metadata) {
+  if ("cell_id" %in% names(metadata)) {
+    ids <- as.character(metadata[["cell_id"]])
+  } else {
+    ids <- rownames(metadata)
+  }
+  if (is.null(ids) || length(ids) != nrow(metadata) ||
+      anyNA(ids) || any(!nzchar(ids)) || anyDuplicated(ids)) {
+    stop("cell IDs must be present, non-empty, and unique", call. = FALSE)
+  }
+  ids
+}
+
+#' Audit the approved fixed Region-level primary inclusion rule.
+#'
+#' The primary rule is intentionally independent of segmentation, control, or
+#' morphology flags: 5 < nFeature_Xenium < 200 and
+#' 10 < nCount_Xenium < 1000. Other flags remain sensitivity annotations.
+#'
+#' @param cells Cell metadata containing the two metrics and `primary_include`.
+#' @return One-row data frame comparing stored and independently recomputed masks.
+audit_fixed_primary_include <- function(cells) {
+  require_columns(
+    cells,
+    c("nFeature_Xenium", "nCount_Xenium", "primary_include"),
+    "cells"
+  )
+  fixed <-
+    cells$nFeature_Xenium > 5 & cells$nFeature_Xenium < 200 &
+    cells$nCount_Xenium > 10 & cells$nCount_Xenium < 1000
+  stored <- cells$primary_include %in% TRUE
+  data.frame(
+    n_cells = as.integer(nrow(cells)),
+    n_fixed_primary = as.integer(sum(fixed, na.rm = TRUE)),
+    n_stored_primary = as.integer(sum(stored, na.rm = TRUE)),
+    n_disagree = as.integer(sum(fixed != stored, na.rm = TRUE)),
+    stored_matches_fixed_rule = identical(stored, fixed)
+  )
+}
+
+#' Calculate marker-definition coverage without dropping absent markers.
+#'
+#' @param marker_df Full marker definition with `Gene_Symbol`,
+#'   `CellType_main`, and `CellType_subtype` columns.
+#' @param available_genes Genes present in the Xenium assay.
+#' @return One row per main/subtype definition. The denominator is the complete
+#'   defined marker list, preventing the misleading 100% coverage caused by
+#'   filtering absent genes before calculating coverage.
+calculate_marker_definition_coverage <- function(marker_df, available_genes) {
+  required <- c("Gene_Symbol", "CellType_main", "CellType_subtype")
+  require_columns(marker_df, required, "marker_df")
+  definitions <- unique(marker_df[, required, drop = FALSE])
+  definitions$present <- definitions$Gene_Symbol %in% available_genes
+
+  groups <- split(
+    definitions,
+    interaction(
+      definitions$CellType_main,
+      definitions$CellType_subtype,
+      drop = TRUE,
+      lex.order = TRUE
+    )
+  )
+  result <- lapply(groups, function(group) {
+    present <- group$present %in% TRUE
+    data.frame(
+      CellType_main = as.character(group$CellType_main[[1L]]),
+      CellType_subtype = as.character(group$CellType_subtype[[1L]]),
+      n_defined = as.integer(nrow(group)),
+      n_present = as.integer(sum(present)),
+      coverage = sum(present) / nrow(group),
+      genes_present = paste(group$Gene_Symbol[present], collapse = ", "),
+      genes_absent = paste(group$Gene_Symbol[!present], collapse = ", "),
+      stringsAsFactors = FALSE
+    )
+  })
+  result <- do.call(rbind, result)
+  rownames(result) <- NULL
+  result[order(result$CellType_main, result$CellType_subtype), , drop = FALSE]
+}
+
+#' Compare two binary cell-type guide definitions descriptively.
+#'
+#' No cell-level p-value is calculated because spatially adjacent Xenium cells
+#' are not independent biological replicates.
+#'
+#' @param first,second Logical vectors aligned to the same cells.
+#' @param first_name,second_name Labels for the definitions.
+#' @return One-row overlap table including the Jaccard index.
+compare_binary_cell_definitions <- function(
+    first,
+    second,
+    first_name = "first",
+    second_name = "second") {
+  if (length(first) != length(second)) {
+    stop("cell-type definition vectors must have equal length", call. = FALSE)
+  }
+  keep <- !is.na(first) & !is.na(second)
+  first <- first[keep] %in% TRUE
+  second <- second[keep] %in% TRUE
+  intersection <- sum(first & second)
+  union <- sum(first | second)
+  data.frame(
+    first_definition = first_name,
+    second_definition = second_name,
+    n_evaluated = as.integer(length(first)),
+    n_first = as.integer(sum(first)),
+    n_second = as.integer(sum(second)),
+    n_intersection = as.integer(intersection),
+    n_union = as.integer(union),
+    jaccard = if (union > 0L) intersection / union else NA_real_,
+    first_supported_by_second = if (sum(first) > 0L) intersection / sum(first) else NA_real_,
+    second_supported_by_first = if (sum(second) > 0L) intersection / sum(second) else NA_real_
+  )
+}
+
+#' Densify ordered manual trace control points by linear interpolation.
+#'
+#' @param control_points Data frame with ordered `x` and `y` coordinates.
+#' @param spacing Approximate distance in micrometres between dense trace points.
+#' @return Dense ordered trace coordinates.
+interpolate_trace_control_points <- function(control_points, spacing = 10) {
+  require_columns(control_points, c("x", "y"), "control_points")
+  if (nrow(control_points) < 2L) {
+    stop("control_points must contain at least two ordered points", call. = FALSE)
+  }
+  if (!is.numeric(spacing) || length(spacing) != 1L ||
+      !is.finite(spacing) || spacing <= 0) {
+    stop("spacing must be one positive finite number", call. = FALSE)
+  }
+
+  segment_length <- sqrt(diff(control_points$x)^2 + diff(control_points$y)^2)
+  keep <- c(TRUE, segment_length > 0)
+  control_points <- control_points[keep, , drop = FALSE]
+  if (nrow(control_points) < 2L) {
+    stop("control_points must span a positive distance", call. = FALSE)
+  }
+
+  control_arc <- c(
+    0,
+    cumsum(sqrt(diff(control_points$x)^2 + diff(control_points$y)^2))
+  )
+  total_length <- control_arc[[length(control_arc)]]
+  target_arc <- seq(0, total_length, by = spacing)
+  if (tail(target_arc, 1) < total_length) {
+    target_arc <- c(target_arc, total_length)
+  }
+
+  data.frame(
+    x = stats::approx(control_arc, control_points$x, xout = target_arc)$y,
+    y = stats::approx(control_arc, control_points$y, xout = target_arc)$y
+  )
+}
+
+#' Add cumulative longitudinal coordinates to an ordered trace.
+#'
+#' @param trace Ordered data frame with `x` and `y` coordinates in micrometres.
+#' @return The trace with `roll_arc_length` and `roll_arc_fraction` columns.
+add_trace_arc_length <- function(trace) {
+  require_columns(trace, c("x", "y"), "trace")
+  if (nrow(trace) < 2L) {
+    stop("trace must contain at least two ordered points", call. = FALSE)
+  }
+
+  step_length <- sqrt(diff(trace$x)^2 + diff(trace$y)^2)
+  total_length <- sum(step_length)
+  if (!is.finite(total_length) || total_length <= 0) {
+    stop("trace must have positive finite arc length", call. = FALSE)
+  }
+
+  trace$roll_arc_length <- c(0, cumsum(step_length))
+  trace$roll_arc_fraction <- trace$roll_arc_length / total_length
+  trace
+}
+
+#' Project cells onto a Mayassi-style ordered Swiss-roll trace.
+#'
+#' @param cells Data frame containing `cell_id`, `x`, and `y` in micrometres.
+#' @param trace Ordered trace returned by `add_trace_arc_length()`.
+#' @param inward_constraint If `TRUE`, reproduce the published global-radius
+#'   eligibility rule that excludes trace points farther from the global center
+#'   than the cell. This rule is retained for audit even though Region 6 fails
+#'   its downstream diagnostics.
+#' @param center Named numeric vector with `x` and `y`. If omitted, the inner
+#'   trace endpoint is used; the Mayassi reproduction supplies the trace mean.
+#' @return Input cells plus accepted trace index, arc coordinates, and unsigned
+#'   Euclidean distance to the accepted trace point.
+project_cells_to_trace <- function(
+    cells,
+    trace,
+    inward_constraint = TRUE,
+    center = NULL) {
+  require_columns(cells, c("cell_id", "x", "y"), "cells")
+  require_columns(
+    trace,
+    c("x", "y", "roll_arc_length", "roll_arc_fraction"),
+    "trace"
+  )
+
+  if (is.null(center)) {
+    center <- c(x = trace$x[[nrow(trace)]], y = trace$y[[nrow(trace)]])
+  }
+  if (is.null(names(center)) || !all(c("x", "y") %in% names(center))) {
+    stop("center must be a named numeric vector with x and y", call. = FALSE)
+  }
+
+  trace_radius <- if ("radius_from_center" %in% names(trace)) {
+    trace$radius_from_center
+  } else {
+    sqrt((trace$x - center[["x"]])^2 + (trace$y - center[["y"]])^2)
+  }
+
+  result <- vector("list", nrow(cells))
+  for (i in seq_len(nrow(cells))) {
+    dx <- trace$x - cells$x[[i]]
+    dy <- trace$y - cells$y[[i]]
+    distance <- sqrt(dx^2 + dy^2)
+
+    eligible <- rep(TRUE, nrow(trace))
+    if (isTRUE(inward_constraint)) {
+      cell_radius <- sqrt(
+        (cells$x[[i]] - center[["x"]])^2 +
+          (cells$y[[i]] - center[["y"]])^2
+      )
+      eligible <- trace_radius <= cell_radius
+    }
+
+    if (!any(eligible)) {
+      result[[i]] <- data.frame(
+        trace_index = NA_integer_, roll_arc_length = NA_real_,
+        roll_arc_fraction = NA_real_, wall_distance = NA_real_
+      )
+      next
+    }
+
+    accepted <- which(eligible)
+    trace_index <- accepted[[which.min(distance[eligible])]]
+    result[[i]] <- data.frame(
+      trace_index = as.integer(trace_index),
+      roll_arc_length = trace$roll_arc_length[[trace_index]],
+      roll_arc_fraction = trace$roll_arc_fraction[[trace_index]],
+      wall_distance = distance[[trace_index]]
+    )
+  }
+
+  cbind(cells, do.call(rbind, result), row.names = NULL)
+}
+
+#' Assess continuity of an ordered trace.
+#'
+#' @param trace Ordered trace with `x` and `y` coordinates.
+#' @param jump_multiplier A step is large when it exceeds this multiple of the
+#'   median positive step.
+#' @return Named list of continuity diagnostics.
+assess_trace_quality <- function(trace, jump_multiplier = 5) {
+  require_columns(trace, c("x", "y"), "trace")
+  if (nrow(trace) < 3L) {
+    stop("trace quality assessment requires at least three points", call. = FALSE)
+  }
+  if (!is.numeric(jump_multiplier) || length(jump_multiplier) != 1L ||
+      !is.finite(jump_multiplier) || jump_multiplier <= 1) {
+    stop("jump_multiplier must be one finite number greater than 1", call. = FALSE)
+  }
+
+  step_length <- sqrt(diff(trace$x)^2 + diff(trace$y)^2)
+  typical_step <- stats::median(step_length[step_length > 0])
+  if (!is.finite(typical_step)) {
+    typical_step <- 0
+  }
+  large_jump <- if (typical_step > 0) {
+    step_length > jump_multiplier * typical_step
+  } else {
+    step_length > 0
+  }
+
+  list(
+    continuous = !any(large_jump),
+    n_large_jumps = as.integer(sum(large_jump)),
+    maximum_step = max(step_length),
+    median_positive_step = typical_step
+  )
+}
+
+#' Score marker groups by cluster.
+#'
+#' @param object Required `object` input; validated before computation.
+#' @param marker_df Required `marker_df` input; validated before computation.
+#' @param group_col Required `group_col` input; validated before computation.
+#' @param cluster_col Optional `cluster_col` input with the default shown in the function signature.
+#' @param assay Optional `assay` input with the default shown in the function signature.
+#' @param layer Optional `layer` input with the default shown in the function signature.
+#' @param score_prefix Optional `score_prefix` input with the default shown in the function signature.
+#' @param detect_prefix Optional `detect_prefix` input with the default shown in the function signature.
+#' @param label_prefix Optional `label_prefix` input with the default shown in the function signature.
+#' @param z_cap Optional `z_cap` input with the default shown in the function signature.
+#' @return Computed evidence or annotations aligned to the supplied rows/cells; raw counts are unchanged.
+score_marker_groups_by_cluster <- function(
+  object,
+  marker_df,
+  group_col,
+  cluster_col = "cluster_res_1_2",
+  assay = "Xenium",
+  layer = "data",
+  score_prefix = "MainScore",
+  detect_prefix = "MainDetect",
+  label_prefix = "Main",
+  z_cap = 3
+) {
+
+  stopifnot(
+    group_col %in% colnames(marker_df),
+    cluster_col %in% colnames(object@meta.data)
+  )
+
+  # ------------------------------------------------------------
+  # 1. Calculate cell-level marker scores
+  # ------------------------------------------------------------
+
+  scores <- calculate_marker_scores(
+    object = object,
+    marker_df = marker_df,
+    group_col = group_col,
+    assay = assay,
+    layer = layer,
+    prefix = score_prefix,
+    z_cap = z_cap
+  )
+
+  # ------------------------------------------------------------
+  # 2. Add score metadata
+  # ------------------------------------------------------------
+
+  object <- Seurat::AddMetaData(
+    object = object,
+    metadata = scores$score
+  )
+
+  # ------------------------------------------------------------
+  # 3. Add marker-detection metadata
+  # ------------------------------------------------------------
+
+  detect_df <- scores$detection
+
+  colnames(detect_df) <- sub(
+    paste0("^", score_prefix, "_"),
+    paste0(detect_prefix, "_"),
+    colnames(detect_df)
+  )
+
+  object <- Seurat::AddMetaData(
+    object = object,
+    metadata = detect_df
+  )
+
+  # ------------------------------------------------------------
+  # 4. Find score columns
+  # ------------------------------------------------------------
+
+  score_cols <- grep(
+    paste0("^", score_prefix, "_"),
+    colnames(object@meta.data),
+    value = TRUE
+  )
+
+  if (length(score_cols) < 2) {
+    stop(
+      "Fewer than two score groups were found for ",
+      group_col,
+      "."
+    )
+  }
+
+  # ------------------------------------------------------------
+  # 5. Summarise scores by cluster
+  # ------------------------------------------------------------
+
+  cluster_scores <- object@meta.data %>%
+    dplyr::group_by(
+      .data[[cluster_col]]
+    ) %>%
+    dplyr::summarise(
+      n_cells = dplyr::n(),
+
+      dplyr::across(
+        dplyr::all_of(score_cols),
+        list(
+          mean = ~ mean(.x, na.rm = TRUE),
+          median = ~ median(.x, na.rm = TRUE)
+        )
+      ),
+
+      .groups = "drop"
+    )
+
+  # ------------------------------------------------------------
+  # 6. Extract mean scores for ranking
+  # ------------------------------------------------------------
+
+  mean_cols <- grep(
+    paste0(
+      "^",
+      score_prefix,
+      "_.*_mean$"
+    ),
+    colnames(cluster_scores),
+    value = TRUE
+  )
+
+  if (length(mean_cols) < 2) {
+    stop(
+      "Could not identify at least two mean score columns."
+    )
+  }
+
+  score_mat <- as.matrix(
+    cluster_scores[
+      ,
+      mean_cols,
+      drop = FALSE
+    ]
+  )
+
+  rownames(score_mat) <- as.character(
+    cluster_scores[[cluster_col]]
+  )
+
+  # ------------------------------------------------------------
+  # 7. Recover biological group names
+  # ------------------------------------------------------------
+
+  labels <- sub(
+    "_mean$",
+    "",
+    sub(
+      paste0("^", score_prefix, "_"),
+      "",
+      mean_cols
+    )
+  )
+
+  # ------------------------------------------------------------
+  # 8. Identify best and second-best groups
+  # ------------------------------------------------------------
+
+  annotation <- lapply(
+    seq_len(nrow(score_mat)),
+    function(i) {
+
+      x <- score_mat[i, ]
+
+      # Deal safely with NA/NaN
+      x[
+        !is.finite(x)
+      ] <- NA_real_
+
+      valid <- which(
+        !is.na(x)
+      )
+
+      if (length(valid) == 0) {
+
+        return(
+          tibble::tibble(
+            cluster = rownames(score_mat)[i],
+            Best_label = NA_character_,
+            Best_score = NA_real_,
+            Second_label = NA_character_,
+            Second_score = NA_real_,
+            Score_margin = NA_real_
+          )
+        )
+      }
+
+      ord <- valid[
+        order(
+          x[valid],
+          decreasing = TRUE
+        )
+      ]
+
+      best_idx <- ord[1]
+
+      if (length(ord) >= 2) {
+
+        second_idx <- ord[2]
+
+        second_label <- labels[second_idx]
+        second_score <- x[second_idx]
+
+        margin <-
+          x[best_idx] -
+          x[second_idx]
+
+      } else {
+
+        second_label <- NA_character_
+        second_score <- NA_real_
+        margin <- NA_real_
+      }
+
+      tibble::tibble(
+        cluster =
+          rownames(score_mat)[i],
+
+        Best_label =
+          labels[best_idx],
+
+        Best_score =
+          x[best_idx],
+
+        Second_label =
+          second_label,
+
+        Second_score =
+          second_score,
+
+        Score_margin =
+          margin
+      )
+    }
+  ) %>%
+    dplyr::bind_rows()
+
+  # ------------------------------------------------------------
+  # 9. Rename output columns appropriately
+  # ------------------------------------------------------------
+
+  colnames(annotation)[
+    colnames(annotation) == "cluster"
+  ] <- cluster_col
+
+  colnames(annotation)[
+    colnames(annotation) == "Best_label"
+  ] <- paste0(
+    label_prefix,
+    "_label"
+  )
+
+  colnames(annotation)[
+    colnames(annotation) == "Best_score"
+  ] <- paste0(
+    label_prefix,
+    "_score"
+  )
+
+  colnames(annotation)[
+    colnames(annotation) == "Second_label"
+  ] <- paste0(
+    label_prefix,
+    "_second"
+  )
+
+  colnames(annotation)[
+    colnames(annotation) == "Second_score"
+  ] <- paste0(
+    label_prefix,
+    "_second_score"
+  )
+
+  colnames(annotation)[
+    colnames(annotation) == "Score_margin"
+  ] <- paste0(
+    label_prefix,
+    "_margin"
+  )
+
+  # ------------------------------------------------------------
+  # 10. Sort clusters numerically where possible
+  # ------------------------------------------------------------
+
+  annotation <- annotation %>%
+    dplyr::mutate(
+      .cluster_numeric =
+        suppressWarnings(
+          as.numeric(
+            as.character(
+              .data[[cluster_col]]
+            )
+          )
+        )
+    ) %>%
+    dplyr::arrange(
+      .cluster_numeric,
+      .data[[cluster_col]]
+    ) %>%
+    dplyr::select(
+      -.cluster_numeric
+    )
+
+  # ------------------------------------------------------------
+  # 11. Return everything
+  # ------------------------------------------------------------
+
+  return(
+    list(
+      object = object,
+
+      cell_scores =
+        scores$score,
+
+      cell_detection =
+        detect_df,
+
+      cluster_scores =
+        cluster_scores,
+
+      score_matrix =
+        score_mat,
+
+      annotation =
+        annotation
+    )
+  )
+}
+
+run_Mayassi_transfer <- function(
+  reference,
+  query,
+  annotation_genes,
+  main_col = "Lineage",
+  subtype_col = "HiRes",
+  prefix
+) {
+
+  DefaultAssay(reference) <- "RNA"
+
+  # Restrict features to genes present in BOTH objects
+  features_use <- Reduce(
+    intersect,
+    list(
+      annotation_genes,
+      rownames(reference),
+      rownames(query)
+    )
+  )
+
+  message(
+    prefix,
+    ": using ",
+    length(features_use),
+    " shared annotation genes"
+  )
+
+  reference <- NormalizeData(
+    reference,
+    assay = "RNA",
+    verbose = FALSE
+  )
+
+  reference <- ScaleData(
+    reference,
+    assay = "RNA",
+    features = features_use,
+    verbose = FALSE
+  )
+
+  reference <- RunPCA(
+    reference,
+    assay = "RNA",
+    features = features_use,
+    npcs = 30,
+    seed.use = 1234,
+    verbose = FALSE
+  )
+
+  anchors <- FindTransferAnchors(
+    reference = reference,
+    query = query,
+    reference.assay = "RNA",
+    query.assay = "Xenium",
+    normalization.method = "LogNormalize",
+    reduction = "pcaproject",
+    features = features_use,
+    dims = 1:30,
+    verbose = FALSE
+  )
+
+  pred_main <- TransferData(
+    anchorset = anchors,
+    refdata = reference[[main_col]][, 1],
+    dims = 1:30,
+    verbose = FALSE
+  )
+
+  pred_subtype <- TransferData(
+    anchorset = anchors,
+    refdata = reference[[subtype_col]][, 1],
+    dims = 1:30,
+    verbose = FALSE
+  )
+
+  # Rename output columns so 2.5m / 12m / all can coexist
+  colnames(pred_main) <- paste0(
+    prefix,
+    "_main_",
+    colnames(pred_main)
+  )
+
+  colnames(pred_subtype) <- paste0(
+    prefix,
+    "_subtype_",
+    colnames(pred_subtype)
+  )
+
+  list(
+    main = pred_main,
+    subtype = pred_subtype,
+    anchors = anchors,
+    features = features_use
+  )
+}

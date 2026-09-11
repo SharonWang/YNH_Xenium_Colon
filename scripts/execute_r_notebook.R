@@ -28,10 +28,15 @@ for (cell_index in seq_along(notebook$cells)) {
   captured <- character()
   error_message <- NULL
   captured <- tryCatch(
-    capture.output(
-      withVisible(eval(parse(text = source_code, keep.source = TRUE), envir = execution_environment)),
-      type = "output"
-    ),
+    capture.output({
+      evaluated <- withVisible(
+        eval(parse(text = source_code, keep.source = TRUE), envir = execution_environment)
+      )
+      # Match an interactive R/Jupyter cell: side-effect output is retained and
+      # only a visible final value is auto-printed. Do not print the internal
+      # list returned by withVisible(), which duplicates every table.
+      if (isTRUE(evaluated$visible)) print(evaluated$value)
+    }, type = "output"),
     error = function(error) {
       error_message <<- conditionMessage(error)
       character()
